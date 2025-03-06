@@ -15,6 +15,7 @@ unsigned long lastPrintTime = 0; // Marca de tiempo para controlar la impresión
 const int printInterval = 5000; // Nuevo intervalo de impresión: 5 segundos
 
 // 📌 Función para probar si la tarjeta SD funciona
+
 void SD_test(void) {
     SPI.begin(SD_SCLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
     if (!SD.begin(SD_CS_PIN)) {
@@ -112,3 +113,4 @@ void loop() {
         Serial.println("📤 Mensaje de prueba enviado (ID: 0x001)");
     }
 }
+// este programa envía un mensaje vía CAN, además lee los mensajes provenientes del PCAN y de la ECU

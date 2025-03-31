@@ -107,26 +107,13 @@ void loop() {
   // === RECEPCIÓN CAN ===
   CAN_frame_t rx_frame;
   while (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 0) == pdTRUE) {
-    // No mostramos nada por Serial para no ensuciar
+    // No mostramos nada por Serial
   }
 
-  // === ENVÍO CAN CADA 100ms ===
+  // === ENVÍO CAN (se mantiene por compatibilidad, no se usa aquí) ===
   if (currentMillis - previousCAN >= interval) {
     previousCAN = currentMillis;
-
-    CAN_frame_t tx_frame;
-    tx_frame.FIR.B.FF = CAN_frame_std;
-    tx_frame.MsgID = 0x001;
-    tx_frame.FIR.B.DLC = 8;
-    tx_frame.data.u8[0] = 0x00;
-    tx_frame.data.u8[1] = 0x01;
-    tx_frame.data.u8[2] = 0x02;
-    tx_frame.data.u8[3] = 0x03;
-    tx_frame.data.u8[4] = 0x04;
-    tx_frame.data.u8[5] = 0x05;
-    tx_frame.data.u8[6] = 0x06;
-    tx_frame.data.u8[7] = 0x07;
-    ESP32Can.CANWriteFrame(&tx_frame);
+    // Nada aquí: ahora el envío CAN se hace tras la lectura
   }
 
   // === CALIBRACIÓN ===
@@ -147,7 +134,7 @@ void loop() {
     return;
   }
 
-  // === MEDICIÓN E IMPRESIÓN CADA 100ms ===
+  // === MEDICIÓN CADA 100ms ===
   if (currentMillis - previousMedicion >= interval) {
     previousMedicion = currentMillis;
 
@@ -171,6 +158,7 @@ void loop() {
     }
     lastPulsadorState = pulsadorState;
 
+    // === CORRIENTE ===
     int lecturaADC = analogRead(SENSOR_PIN);
     float voltaje = (lecturaADC / 4095.0) * 3.3;
 
@@ -188,6 +176,7 @@ void loop() {
     idxMedia = (idxMedia + 1) % N_MEDIA;
     float corrienteFiltrada2 = sumaMedia / N_MEDIA;
 
+    // === VOLTAJE REAL ===
     int lecturaVoltajeADC = analogRead(VOLTAJE_PIN);
     float voltajeADC = (lecturaVoltajeADC / 4095.0) * 3.3;
     bufferMedianaVolt[idxMedianaVolt] = voltajeADC;
@@ -197,6 +186,24 @@ void loop() {
 
     float potencia = corrienteIIR * voltajeReal;
 
+    // === ENVÍO CAN (justo después de lectura y antes de impresión) ===
+        // === ENVÍO CAN (justo después de lectura y antes de impresión) ===
+        CAN_frame_t tx_frame;
+        tx_frame.FIR.B.FF = CAN_frame_std;
+        tx_frame.MsgID = 0x298;
+        tx_frame.FIR.B.DLC = 8;
+        tx_frame.data.u8[0] = pulsadorValor;
+        tx_frame.data.u8[1] = encoderSteps;
+        tx_frame.data.u8[2] = 0x00;
+        tx_frame.data.u8[3] = 0x00;
+        tx_frame.data.u8[4] = 0x00;
+        tx_frame.data.u8[5] = 0x00;
+        tx_frame.data.u8[6] = 0x00;
+        tx_frame.data.u8[7] = 0x00;
+        ESP32Can.CANWriteFrame(&tx_frame);
+    
+
+    // === IMPRESIÓN SERIAL ===
     Serial.print(voltaje, 4);             Serial.print(",");
     Serial.print(corriente, 4);           Serial.print(",");
     Serial.print(voltajeFiltrado, 4);     Serial.print(",");

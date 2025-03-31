@@ -6,7 +6,7 @@
 
 #define SENSOR_PIN 35
 #define VOLTAJE_PIN 34
-#define TIEMPO_CALIBRACION_MS 10000
+#define TIEMPO_CALIBRACION_MS 100
 
 #define ENCODER_CLK 32
 #define ENCODER_DT  33
@@ -17,7 +17,7 @@ const float DIVISOR_FACTOR = 5.057;
 unsigned long tiempoInicio = 0;
 bool calibrado = false;
 float VREF = 0.0;
-float sensibilidad = 0.0267;
+float sensibilidad = 0.0406;  // Fijado directamente
 
 const uint8_t N_MEDIANA = 15;
 float bufferMediana[N_MEDIANA] = {0.0};
@@ -53,13 +53,17 @@ uint8_t last_mapa = 0;
 uint8_t last_error = 0;
 
 // ENCODER
-int encoderSteps = 100;  // empezamos en un valor intermedio
+int encoderSteps = 100;
 int lastCLK = HIGH;
 
 // PULSADOR
 int pulsadorState = HIGH;
 int lastPulsadorState = HIGH;
 int pulsadorValor = 0;
+
+// TEMPORIZADOR
+unsigned long t_anterior = 0;
+const unsigned long intervalo = 100; // ms
 
 float medianaN(float* arr, uint8_t size) {
   float temp[size];
@@ -78,7 +82,7 @@ float medianaN(float* arr, uint8_t size) {
 
 void processCANMessages() {
   CAN_frame_t rx_frame;
-  while (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 0) == pdTRUE) {
+  while (xQueueReceive(CAN_cfg.rx_queue, &rx_frame,  3 * portTICK_PERIOD_MS) == pdTRUE) {
     if (rx_frame.MsgID == 0x290) {
       last_torque = rx_frame.data.u8[0];
       last_duty = rx_frame.data.u8[1];
@@ -103,9 +107,7 @@ void setup() {
   pinMode(ENCODER_SW, INPUT_PULLUP);
   lastCLK = digitalRead(ENCODER_CLK);
 
-  Serial.println("Introduce la sensibilidad del sensor en mV/A y pulsa ENTER:");
-  while (Serial.available() == 0) { delay(10); }
-  sensibilidad = Serial.parseFloat() / 1000.0;
+  sensibilidad = 0.0406;
   Serial.print("Sensibilidad establecida: ");
   Serial.print(sensibilidad, 6);
   Serial.println(" V/A");
@@ -122,31 +124,10 @@ void setup() {
 
 void loop() {
   unsigned long ahora = millis();
-  processCANMessages();
-
-  int currentCLK = digitalRead(ENCODER_CLK);
-  if (currentCLK != lastCLK && currentCLK == LOW) {
-    if (digitalRead(ENCODER_DT) != currentCLK) {
-      encoderSteps++;
-    } else {
-      encoderSteps--;
-    }
-    if (encoderSteps < 10) encoderSteps = 10;
-    if (encoderSteps > 250) encoderSteps = 250;
-  }
-  lastCLK = currentCLK;
-
-  pulsadorState = digitalRead(ENCODER_SW);
-  if (pulsadorState == LOW && lastPulsadorState == HIGH) {
-    pulsadorValor++;
-    if (pulsadorValor > 5) pulsadorValor = 0;
-  }
-  lastPulsadorState = pulsadorState;
-
-  int lecturaADC = analogRead(SENSOR_PIN);
-  float voltaje = (lecturaADC / 4095.0) * 3.3;
 
   if (!calibrado) {
+    int lecturaADC = analogRead(SENSOR_PIN);
+    float voltaje = (lecturaADC / 4095.0) * 3.3;
     sumaVref += voltaje;
     muestrasVref++;
     if (ahora - tiempoInicio >= TIEMPO_CALIBRACION_MS) {
@@ -161,46 +142,78 @@ void loop() {
     return;
   }
 
-  float corriente = (voltaje - VREF) / sensibilidad;
-  corrienteIIR = alphaIIR * corriente + (1 - alphaIIR) * corrienteIIR;
+  if (ahora - t_anterior >= intervalo) {
+    t_anterior = ahora;
 
-  bufferMediana[idxMediana] = voltaje;
-  idxMediana = (idxMediana + 1) % N_MEDIANA;
-  float voltajeFiltrado = medianaN(bufferMediana, N_MEDIANA);
-  float corrienteFiltrada1 = (voltajeFiltrado - VREF) / sensibilidad;
+    processCANMessages();
 
-  sumaMedia -= bufferMedia[idxMedia];
-  bufferMedia[idxMedia] = corrienteFiltrada1;
-  sumaMedia += corrienteFiltrada1;
-  idxMedia = (idxMedia + 1) % N_MEDIA;
-  float corrienteFiltrada2 = sumaMedia / N_MEDIA;
+    // === ENCODER ===
+    int currentCLK = digitalRead(ENCODER_CLK);
+    if (currentCLK != lastCLK && currentCLK == LOW) {
+      if (digitalRead(ENCODER_DT) != currentCLK) {
+        encoderSteps++;
+      } else {
+        encoderSteps--;
+      }
+      encoderSteps = constrain(encoderSteps, 10, 250);
+    }
+    lastCLK = currentCLK;
 
-  int lecturaVoltajeADC = analogRead(VOLTAJE_PIN);
-  float voltajeADC = (lecturaVoltajeADC / 4095.0) * 3.3;
-  bufferMedianaVolt[idxMedianaVolt] = voltajeADC;
-  idxMedianaVolt = (idxMedianaVolt + 1) % N_MEDIANA_VOLT;
-  float voltajeADC_med = medianaN(bufferMedianaVolt, N_MEDIANA_VOLT);
-  float voltajeReal = voltajeADC_med * DIVISOR_FACTOR;
+    // === PULSADOR ===
+    pulsadorState = digitalRead(ENCODER_SW);
+    if (pulsadorState == LOW && lastPulsadorState == HIGH) {
+      pulsadorValor++;
+      if (pulsadorValor > 5) pulsadorValor = 0;
+    }
+    lastPulsadorState = pulsadorState;
 
-  float potencia = corrienteIIR * voltajeReal;
+    int lecturaADC = analogRead(SENSOR_PIN);
+    float voltaje = (lecturaADC / 4095.0) * 3.3;
 
-  Serial.print(voltaje, 4);             Serial.print(",");
-  Serial.print(corriente, 4);           Serial.print(",");
-  Serial.print(voltajeFiltrado, 4);     Serial.print(",");
-  Serial.print(corrienteFiltrada1, 4);  Serial.print(",");
-  Serial.print(corrienteFiltrada2, 4);  Serial.print(",");
-  Serial.print(corrienteIIR, 4);        Serial.print(",");
-  Serial.print(voltajeReal, 3);         Serial.print(",");
-  Serial.print(last_torque);            Serial.print(",");
-  Serial.print(last_duty);              Serial.print(",");
-  Serial.print(last_corriente);         Serial.print(",");
-  Serial.print(last_voltaje_CAN, 1);    Serial.print(",");
-  Serial.print(last_switch);            Serial.print(",");
-  Serial.print(last_temp);              Serial.print(",");
-  Serial.print(last_angle_dir);         Serial.print(",");
-  Serial.print(last_mapa);              Serial.print(",");
-  Serial.print(last_error);             Serial.print(",");
-  Serial.print(potencia, 4);            Serial.print(",");
-  Serial.print(encoderSteps);           Serial.print(",");
-  Serial.println(pulsadorValor);
+    float corriente = (voltaje - VREF) / sensibilidad;
+    corrienteIIR = alphaIIR * corriente + (1 - alphaIIR) * corrienteIIR;
+
+    bufferMediana[idxMediana] = voltaje;
+    idxMediana = (idxMediana + 1) % N_MEDIANA;
+    float voltajeFiltrado = medianaN(bufferMediana, N_MEDIANA);
+    float corrienteFiltrada1 = (voltajeFiltrado - VREF) / sensibilidad;
+
+    sumaMedia -= bufferMedia[idxMedia];
+    bufferMedia[idxMedia] = corrienteFiltrada1;
+    sumaMedia += corrienteFiltrada1;
+    idxMedia = (idxMedia + 1) % N_MEDIA;
+    float corrienteFiltrada2 = sumaMedia / N_MEDIA;
+
+    int lecturaVoltajeADC = analogRead(VOLTAJE_PIN);
+    float voltajeADC = (lecturaVoltajeADC / 4095.0) * 3.3;
+    bufferMedianaVolt[idxMedianaVolt] = voltajeADC;
+    idxMedianaVolt = (idxMedianaVolt + 1) % N_MEDIANA_VOLT;
+    float voltajeADC_med = medianaN(bufferMedianaVolt, N_MEDIANA_VOLT);
+    float voltajeReal = voltajeADC_med * DIVISOR_FACTOR;
+
+    float potencia = corrienteIIR * voltajeReal;
+
+    Serial.print(voltaje, 4);             Serial.print(",");
+    Serial.print(corriente, 4);           Serial.print(",");
+    Serial.print(voltajeFiltrado, 4);     Serial.print(",");
+    Serial.print(corrienteFiltrada1, 4);  Serial.print(",");
+    Serial.print(corrienteFiltrada2, 4);  Serial.print(",");
+    Serial.print(corrienteIIR, 4);        Serial.print(",");
+    Serial.print(voltajeReal, 3);         Serial.print(",");
+    Serial.print(last_torque);            Serial.print(",");
+    Serial.print(last_duty);              Serial.print(",");
+    Serial.print(last_corriente);         Serial.print(",");
+    Serial.print(last_voltaje_CAN, 1);    Serial.print(",");
+    Serial.print(last_switch);            Serial.print(",");
+    Serial.print(last_temp);              Serial.print(",");
+    Serial.print(last_angle_dir);         Serial.print(",");
+    Serial.print(last_mapa);              Serial.print(",");
+    Serial.print(last_error);             Serial.print(",");
+    Serial.print(potencia, 4);            Serial.print(",");
+    Serial.print(encoderSteps);           Serial.print(",");
+    Serial.println(pulsadorValor);
+    
+    
+   
+  }
 }

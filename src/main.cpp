@@ -14,8 +14,6 @@
 #define ENCODER_DT  33
 #define ENCODER_SW 25
 
-
-
 const float DIVISOR_FACTOR = 5.057;
 
 unsigned long tiempoInicio = 0;
@@ -51,14 +49,13 @@ int pulsadorState = HIGH;
 int lastPulsadorState = HIGH;
 int pulsadorValor = 0;
 
-// TEMPORIZADOR
-//unsigned long previousMillis = 0;
-//const unsigned long interval = 100; // ms
-
-CAN_device_t CAN_cfg;             // CAN Config
-unsigned long previousMillis = 0; // will store last time a CAN Message was send
-const int interval = 100;        // interval at which send CAN Messages (milliseconds)
+// TEMPORIZADORES
+CAN_device_t CAN_cfg;
 const int rx_queue_size = 10;
+const int interval = 100;
+
+unsigned long previousCAN = 0;
+unsigned long previousMedicion = 0;
 
 float medianaN(float* arr, uint8_t size) {
   float temp[size];
@@ -76,22 +73,12 @@ float medianaN(float* arr, uint8_t size) {
 }
 
 void setup() {
-
   pinMode(PIN_5V_EN, OUTPUT);
   digitalWrite(PIN_5V_EN, HIGH);
 
   pinMode(CAN_SE_PIN, OUTPUT);
   digitalWrite(CAN_SE_PIN, LOW);
 
-  Serial.begin(576000);
-
-  
-  CAN_cfg.speed = CAN_SPEED_250KBPS;
-  CAN_cfg.tx_pin_id = GPIO_NUM_27;
-  CAN_cfg.rx_pin_id = GPIO_NUM_26;
-  CAN_cfg.rx_queue = xQueueCreate(rx_queue_size, sizeof(CAN_frame_t));
-  // Init CAN Module
-  ESP32Can.CANInit();
   Serial.begin(576000);
   analogReadResolution(12);
 
@@ -106,45 +93,27 @@ void setup() {
   Serial.println(" V/A");
   Serial.println("⚙️ Calibrando VREF durante 10 segundos, mantén el motor en idle...");
   tiempoInicio = millis();
+
+  CAN_cfg.speed = CAN_SPEED_250KBPS;
+  CAN_cfg.tx_pin_id = GPIO_NUM_27;
+  CAN_cfg.rx_pin_id = GPIO_NUM_26;
+  CAN_cfg.rx_queue = xQueueCreate(rx_queue_size, sizeof(CAN_frame_t));
+  ESP32Can.CANInit();
 }
 
 void loop() {
-
-  CAN_frame_t rx_frame;
-
   unsigned long currentMillis = millis();
 
-  // Receive next CAN frame from queue
-  if (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 3 * portTICK_PERIOD_MS) == pdTRUE)
-  {
-
-    if (rx_frame.FIR.B.FF == CAN_frame_std)
-    {
-      printf("New standard frame");
-    }
-    else
-    {
-      printf("New extended frame");
-    }
-
-    if (rx_frame.FIR.B.RTR == CAN_RTR)
-    {
-      printf(" RTR from 0x%08X, DLC %d\r\n", rx_frame.MsgID, rx_frame.FIR.B.DLC);
-    }
-    else
-    {
-      printf(" from 0x%08X, DLC %d, Data ", rx_frame.MsgID, rx_frame.FIR.B.DLC);
-      for (int i = 0; i < rx_frame.FIR.B.DLC; i++)
-      {
-        printf("0x%02X ", rx_frame.data.u8[i]);
-      }
-      printf("\n");
-    }
+  // === RECEPCIÓN CAN ===
+  CAN_frame_t rx_frame;
+  while (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 0) == pdTRUE) {
+    // No mostramos nada por Serial para no ensuciar
   }
-  // Send CAN Message
-  if (currentMillis - previousMillis >= interval)
-  {
-    previousMillis = currentMillis;
+
+  // === ENVÍO CAN CADA 100ms ===
+  if (currentMillis - previousCAN >= interval) {
+    previousCAN = currentMillis;
+
     CAN_frame_t tx_frame;
     tx_frame.FIR.B.FF = CAN_frame_std;
     tx_frame.MsgID = 0x001;
@@ -157,13 +126,10 @@ void loop() {
     tx_frame.data.u8[5] = 0x05;
     tx_frame.data.u8[6] = 0x06;
     tx_frame.data.u8[7] = 0x07;
-
     ESP32Can.CANWriteFrame(&tx_frame);
-    
   }
 
-  //unsigned long currentMillis = millis();
-
+  // === CALIBRACIÓN ===
   if (!calibrado) {
     int lecturaADC = analogRead(SENSOR_PIN);
     float voltaje = (lecturaADC / 4095.0) * 3.3;
@@ -181,8 +147,9 @@ void loop() {
     return;
   }
 
-  if (currentMillis - previousMillis >= interval) {
-    previousMillis = currentMillis;
+  // === MEDICIÓN E IMPRESIÓN CADA 100ms ===
+  if (currentMillis - previousMedicion >= interval) {
+    previousMedicion = currentMillis;
 
     // === ENCODER ===
     int currentCLK = digitalRead(ENCODER_CLK);

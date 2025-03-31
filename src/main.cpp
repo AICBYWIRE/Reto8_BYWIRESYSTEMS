@@ -8,7 +8,7 @@
 
 #define SENSOR_PIN 35
 #define VOLTAJE_PIN 34
-#define TIEMPO_CALIBRACION_MS 100
+#define TIEMPO_CALIBRACION_MS 1000 
 
 #define ENCODER_CLK 32
 #define ENCODER_DT  33
@@ -21,6 +21,7 @@ bool calibrado = false;
 float VREF = 0.0;
 float sensibilidad = 0.0406;
 
+// Filtros
 const uint8_t N_MEDIANA = 15;
 float bufferMediana[N_MEDIANA] = {0.0};
 uint8_t idxMediana = 0;
@@ -40,23 +41,21 @@ const float alphaIIR = 0.2;
 float sumaVref = 0.0;
 unsigned long muestrasVref = 0;
 
-// ENCODER
+// Encoder y pulsador
 int encoderSteps = 100;
 int lastCLK = HIGH;
 
-// PULSADOR
 int pulsadorState = HIGH;
 int lastPulsadorState = HIGH;
 int pulsadorValor = 0;
 
-// TEMPORIZADORES
+// Temporizadores
 CAN_device_t CAN_cfg;
 const int rx_queue_size = 10;
 const int interval = 10;
-
 unsigned long previousMedicion = 0;
 
-// Variables de CAN recibidas
+// CAN recibidos
 uint8_t last_torque = 0;
 uint8_t last_duty = 0;
 uint8_t last_corriente = 0;
@@ -97,7 +96,6 @@ void setup() {
   pinMode(ENCODER_SW, INPUT_PULLUP);
   lastCLK = digitalRead(ENCODER_CLK);
 
-  sensibilidad = 0.0406;
   Serial.print("Sensibilidad establecida: ");
   Serial.print(sensibilidad, 6);
   Serial.println(" V/A");
@@ -132,10 +130,11 @@ void loop() {
     return;
   }
 
-  // === MEDICIÓN CADA INTERVALO ===
+  // === MEDICIÓN ===
   if (currentMillis - previousMedicion >= interval) {
     previousMedicion = currentMillis;
- // recepción de mensajes CAN
+
+    // === CAN RX ===
     CAN_frame_t rx_frame;
     while (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 0) == pdTRUE) {
       if (rx_frame.MsgID == 0x290) {
@@ -155,11 +154,7 @@ void loop() {
     // === ENCODER ===
     int currentCLK = digitalRead(ENCODER_CLK);
     if (currentCLK != lastCLK && currentCLK == LOW) {
-      if (digitalRead(ENCODER_DT) != currentCLK) {
-        encoderSteps++;
-      } else {
-        encoderSteps--;
-      }
+      encoderSteps += (digitalRead(ENCODER_DT) != currentCLK) ? 20 : -20;
       encoderSteps = constrain(encoderSteps, 10, 250);
     }
     lastCLK = currentCLK;
@@ -167,15 +162,13 @@ void loop() {
     // === PULSADOR ===
     pulsadorState = digitalRead(ENCODER_SW);
     if (pulsadorState == LOW && lastPulsadorState == HIGH) {
-      pulsadorValor++;
-      if (pulsadorValor > 5) pulsadorValor = 0;
+      pulsadorValor = (pulsadorValor + 1) % 6;
     }
     lastPulsadorState = pulsadorState;
 
-    // === CORRIENTE ===
+    // === LECTURAS ANALÓGICAS ===
     int lecturaADC = analogRead(SENSOR_PIN);
     float voltaje = (lecturaADC / 4095.0) * 3.3;
-
     float corriente = (voltaje - VREF) / sensibilidad;
     corrienteIIR = alphaIIR * corriente + (1 - alphaIIR) * corrienteIIR;
 
@@ -190,17 +183,14 @@ void loop() {
     idxMedia = (idxMedia + 1) % N_MEDIA;
     float corrienteFiltrada2 = sumaMedia / N_MEDIA;
 
-    // === VOLTAJE REAL ===
     int lecturaVoltajeADC = analogRead(VOLTAJE_PIN);
     float voltajeADC = (lecturaVoltajeADC / 4095.0) * 3.3;
     bufferMedianaVolt[idxMedianaVolt] = voltajeADC;
     idxMedianaVolt = (idxMedianaVolt + 1) % N_MEDIANA_VOLT;
-    float voltajeADC_med = medianaN(bufferMedianaVolt, N_MEDIANA_VOLT);
-    float voltajeReal = voltajeADC_med * DIVISOR_FACTOR;
-
+    float voltajeReal = medianaN(bufferMedianaVolt, N_MEDIANA_VOLT) * DIVISOR_FACTOR;
     float potencia = corrienteIIR * voltajeReal;
 
-    // === ENVÍO CAN ===
+    // === CAN TX ===
     CAN_frame_t tx_frame;
     tx_frame.FIR.B.FF = CAN_frame_std;
     tx_frame.MsgID = 0x298;
@@ -215,7 +205,7 @@ void loop() {
     tx_frame.data.u8[7] = 0x00;
     ESP32Can.CANWriteFrame(&tx_frame);
 
-    // === IMPRESIÓN SERIAL ===
+    // === SERIAL PRINT ===
     Serial.print(voltaje, 4);             Serial.print(",");
     Serial.print(corriente, 4);           Serial.print(",");
     Serial.print(voltajeFiltrado, 4);     Serial.print(",");

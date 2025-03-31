@@ -52,10 +52,20 @@ int pulsadorValor = 0;
 // TEMPORIZADORES
 CAN_device_t CAN_cfg;
 const int rx_queue_size = 10;
-const int interval = 100;
+const int interval = 10;
 
-unsigned long previousCAN = 0;
 unsigned long previousMedicion = 0;
+
+// Variables de CAN recibidas
+uint8_t last_torque = 0;
+uint8_t last_duty = 0;
+uint8_t last_corriente = 0;
+float last_voltaje_CAN = 0.0;
+uint8_t last_switch = 0;
+uint8_t last_temp = 0;
+uint8_t last_angle_dir = 0;
+uint8_t last_mapa = 0;
+uint8_t last_error = 0;
 
 float medianaN(float* arr, uint8_t size) {
   float temp[size];
@@ -79,7 +89,7 @@ void setup() {
   pinMode(CAN_SE_PIN, OUTPUT);
   digitalWrite(CAN_SE_PIN, LOW);
 
-  Serial.begin(576000);
+  Serial.begin(921600);
   analogReadResolution(12);
 
   pinMode(ENCODER_CLK, INPUT);
@@ -104,18 +114,6 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
 
-  // === RECEPCIÓN CAN ===
-  CAN_frame_t rx_frame;
-  while (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 0) == pdTRUE) {
-    // No mostramos nada por Serial
-  }
-
-  // === ENVÍO CAN (se mantiene por compatibilidad, no se usa aquí) ===
-  if (currentMillis - previousCAN >= interval) {
-    previousCAN = currentMillis;
-    // Nada aquí: ahora el envío CAN se hace tras la lectura
-  }
-
   // === CALIBRACIÓN ===
   if (!calibrado) {
     int lecturaADC = analogRead(SENSOR_PIN);
@@ -128,15 +126,31 @@ void loop() {
       Serial.print("✅ Calibración completada. VREF = ");
       Serial.print(VREF, 4);
       Serial.println(" V");
-      Serial.println("V_sensor(V),I_direct(A),V_mediana(V),I_filtrado1(A),I_filtrado2(A),I_IIR(A),V_real(V),P(W),EncoderSteps,Pulsador");
+      Serial.println("V_sensor(V),I_direct(A),V_mediana(V),I_filtrado1(A),I_filtrado2(A),I_IIR(A),V_real(V),Torque(bits),MotorDuty(%),I_CAN(A),V_CAN(V),SwitchPos,Temp(°C),DirAngle(bits),Mapa,Error,P(W),EncoderSteps,Pulsador");
       delay(1000);
     }
     return;
   }
 
-  // === MEDICIÓN CADA 100ms ===
+  // === MEDICIÓN CADA INTERVALO ===
   if (currentMillis - previousMedicion >= interval) {
     previousMedicion = currentMillis;
+ // recepción de mensajes CAN
+    CAN_frame_t rx_frame;
+    while (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 0) == pdTRUE) {
+      if (rx_frame.MsgID == 0x290) {
+        last_torque      = rx_frame.data.u8[0];
+        last_duty        = rx_frame.data.u8[1];
+        last_corriente   = rx_frame.data.u8[2];
+        last_voltaje_CAN = rx_frame.data.u8[3] * 0.1;
+        last_switch      = rx_frame.data.u8[4];
+        last_temp        = rx_frame.data.u8[5];
+      } else if (rx_frame.MsgID == 0x292) {
+        last_angle_dir   = rx_frame.data.u8[0];
+        last_mapa        = rx_frame.data.u8[3];
+        last_error       = rx_frame.data.u8[4];
+      }
+    }
 
     // === ENCODER ===
     int currentCLK = digitalRead(ENCODER_CLK);
@@ -186,22 +200,20 @@ void loop() {
 
     float potencia = corrienteIIR * voltajeReal;
 
-    // === ENVÍO CAN (justo después de lectura y antes de impresión) ===
-        // === ENVÍO CAN (justo después de lectura y antes de impresión) ===
-        CAN_frame_t tx_frame;
-        tx_frame.FIR.B.FF = CAN_frame_std;
-        tx_frame.MsgID = 0x298;
-        tx_frame.FIR.B.DLC = 8;
-        tx_frame.data.u8[0] = pulsadorValor;
-        tx_frame.data.u8[1] = encoderSteps;
-        tx_frame.data.u8[2] = 0x00;
-        tx_frame.data.u8[3] = 0x00;
-        tx_frame.data.u8[4] = 0x00;
-        tx_frame.data.u8[5] = 0x00;
-        tx_frame.data.u8[6] = 0x00;
-        tx_frame.data.u8[7] = 0x00;
-        ESP32Can.CANWriteFrame(&tx_frame);
-    
+    // === ENVÍO CAN ===
+    CAN_frame_t tx_frame;
+    tx_frame.FIR.B.FF = CAN_frame_std;
+    tx_frame.MsgID = 0x298;
+    tx_frame.FIR.B.DLC = 8;
+    tx_frame.data.u8[0] = pulsadorValor;
+    tx_frame.data.u8[1] = encoderSteps;
+    tx_frame.data.u8[2] = 0x00;
+    tx_frame.data.u8[3] = 0x00;
+    tx_frame.data.u8[4] = 0x00;
+    tx_frame.data.u8[5] = 0x00;
+    tx_frame.data.u8[6] = 0x00;
+    tx_frame.data.u8[7] = 0x00;
+    ESP32Can.CANWriteFrame(&tx_frame);
 
     // === IMPRESIÓN SERIAL ===
     Serial.print(voltaje, 4);             Serial.print(",");
@@ -211,6 +223,17 @@ void loop() {
     Serial.print(corrienteFiltrada2, 4);  Serial.print(",");
     Serial.print(corrienteIIR, 4);        Serial.print(",");
     Serial.print(voltajeReal, 3);         Serial.print(",");
+
+    Serial.print(last_torque);            Serial.print(",");
+    Serial.print(last_duty);              Serial.print(",");
+    Serial.print(last_corriente);         Serial.print(",");
+    Serial.print(last_voltaje_CAN, 1);    Serial.print(",");
+    Serial.print(last_switch);            Serial.print(",");
+    Serial.print(last_temp);              Serial.print(",");
+    Serial.print(last_angle_dir);         Serial.print(",");
+    Serial.print(last_mapa);              Serial.print(",");
+    Serial.print(last_error);             Serial.print(",");
+
     Serial.print(potencia, 4);            Serial.print(",");
     Serial.print(encoderSteps);           Serial.print(",");
     Serial.println(pulsadorValor);

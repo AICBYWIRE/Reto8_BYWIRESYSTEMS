@@ -6,7 +6,6 @@
 #include <SPI.h>
 #include <SD.h>
 
-// === Pines asignados ===
 #define VOLTAJE_HALL     35
 #define VOLTAJE_BATERIA  34
 #define ENCODER_CLK      32
@@ -16,7 +15,17 @@
 #define TIEMPO_CALIBRACION_MS 10000
 const float DIVISOR_FACTOR = 5.057;
 
-// === Variables de calibración ===
+// === Torque máximo del volante y cremallera ===
+const float TORQUE_MAX_VOLANTE = 3.0;          // Nm
+const float TORQUE_MAX_CREMALLERA = 90.0;      // Nm
+
+// === Función de cálculo de par en el volante ===
+float calcularTorqueVolante(float corriente_final) {
+  float torque_final = 1.2 * corriente_final; // Ajustable
+  float torque_final_volante = torque_final * (TORQUE_MAX_VOLANTE / TORQUE_MAX_CREMALLERA);
+  return constrain(torque_final_volante, -TORQUE_MAX_VOLANTE, TORQUE_MAX_VOLANTE);
+}
+
 unsigned long tiempoInicio = 0;
 bool calibrado = false;
 float VREF = 0.0;
@@ -24,14 +33,12 @@ float sensibilidad = 0.0267;
 float sumaVref = 0.0;
 unsigned long muestrasVref = 0;
 
-// === Encoder y pulsador ===
 int encoderSteps = 100;
 int lastCLK = HIGH;
 int pulsadorState = HIGH;
 int lastPulsadorState = HIGH;
 int pulsadorValor = 0;
 
-// === Filtros para voltaje_final ===
 const uint8_t KERNEL_MEDIANA = 3;
 float bufferMedianaVoltaje[KERNEL_MEDIANA] = {0.0};
 uint8_t idxMedianaVoltaje = 0;
@@ -44,13 +51,11 @@ uint8_t idxMediaVoltaje = 0;
 float voltajeIIR = 0.0;
 const float alphaVoltajeIIR = 0.5;
 
-// === CAN ===
 CAN_device_t CAN_cfg;
 const int rx_queue_size = 10;
-const int interval = 10;
+const int interval = 3;
 unsigned long previousMedicion = 0;
 
-// === CAN recibidos ===
 uint8_t last_duty = 0;
 uint8_t last_corriente = 0;
 float last_voltaje_CAN = 0.0;
@@ -60,7 +65,6 @@ uint8_t last_angle_dir = 0;
 uint8_t last_mapa = 0;
 uint8_t last_error = 0;
 
-// === Función de mediana ===
 float medianaN(float* arr, uint8_t size) {
   float temp[size];
   memcpy(temp, arr, size * sizeof(float));
@@ -79,7 +83,6 @@ float medianaN(float* arr, uint8_t size) {
 void setup() {
   pinMode(PIN_5V_EN, OUTPUT);
   digitalWrite(PIN_5V_EN, HIGH);
-
   pinMode(CAN_SE_PIN, OUTPUT);
   digitalWrite(CAN_SE_PIN, LOW);
 
@@ -104,7 +107,6 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
 
-  // === CALIBRACIÓN VREF ===
   if (!calibrado) {
     int lecturaADC = analogRead(VOLTAJE_HALL);
     float voltaje = (lecturaADC / 4095.0) * 3.3;
@@ -116,17 +118,15 @@ void loop() {
       Serial.print("✅ Calibración completada. VREF = ");
       Serial.print(VREF, 4);
       Serial.println(" V");
-      Serial.println("V_hall(V),MotorDuty(%),I_CAN(A),V_CAN(V),SwitchPos,Temp(°C),DirAngle(bits),Mapa,Error,EncoderSteps,Pulsador,V_final(V),I_final(A),Torque_final(N·m)");
+      Serial.println("V_hall(V),MotorDuty(%),I_CAN(A),V_CAN(V),SwitchPos,Temp(°C),DirAngle(bits),Mapa,Error,EncoderSteps,Pulsador,V_final(V),I_final(A),Torque_final(N·m),Torque_volante(N·m)");
       delay(1000);
     }
     return;
   }
 
-  // === MEDICIÓN ===
   if (currentMillis - previousMedicion >= interval) {
     previousMedicion = currentMillis;
 
-    // === CAN RX ===
     CAN_frame_t rx_frame;
     while (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 0) == pdTRUE) {
       if (rx_frame.MsgID == 0x290) {
@@ -142,7 +142,6 @@ void loop() {
       }
     }
 
-    // === ENCODER ===
     int currentCLK = digitalRead(ENCODER_CLK);
     if (currentCLK != lastCLK && currentCLK == LOW) {
       encoderSteps += (digitalRead(ENCODER_DT) != currentCLK) ? 20 : -20;
@@ -150,14 +149,12 @@ void loop() {
     }
     lastCLK = currentCLK;
 
-    // === PULSADOR ===
     pulsadorState = digitalRead(ENCODER_SW);
     if (pulsadorState == LOW && lastPulsadorState == HIGH) {
       pulsadorValor = (pulsadorValor + 1) % 6;
     }
     lastPulsadorState = pulsadorState;
 
-    // === VOLTAJE_HALL y filtro completo ===
     int lecturaADC = analogRead(VOLTAJE_HALL);
     float voltaje = (lecturaADC / 4095.0) * 3.3;
 
@@ -176,8 +173,8 @@ void loop() {
 
     float corriente_final = (voltaje_final - VREF) / sensibilidad;
     float torque_final = 1.2 * corriente_final;
+    float torque_final_volante = calcularTorqueVolante(corriente_final);
 
-    // === CAN TX (encoder y pulsador) ===
     CAN_frame_t tx_frame;
     tx_frame.FIR.B.FF = CAN_frame_std;
     tx_frame.MsgID = 0x298;
@@ -187,7 +184,6 @@ void loop() {
     for (int i = 2; i < 8; i++) tx_frame.data.u8[i] = 0x00;
     ESP32Can.CANWriteFrame(&tx_frame);
 
-    // === SERIAL PRINT ===
     Serial.print(voltaje, 4);             Serial.print(",");
     Serial.print(last_duty);              Serial.print(",");
     Serial.print(last_corriente);         Serial.print(",");
@@ -201,6 +197,7 @@ void loop() {
     Serial.print(pulsadorValor);          Serial.print(",");
     Serial.print(voltaje_final, 4);       Serial.print(",");
     Serial.print(corriente_final, 4);     Serial.print(",");
-    Serial.println(torque_final, 4);
+    Serial.print(torque_final, 4);        Serial.print(",");
+    Serial.println(torque_final_volante, 4);
   }
 }

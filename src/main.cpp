@@ -6,7 +6,6 @@
 #include <SPI.h>
 #include <SD.h>
 
-// Pines
 #define VOLTAJE_HALL     35
 #define VOLTAJE_BATERIA  34
 #define ENCODER_CLK      32
@@ -16,15 +15,15 @@
 #define TIEMPO_CALIBRACION_MS 10000
 const float DIVISOR_FACTOR = 5.057;
 
-const float TORQUE_MAX_VOLANTE = 7.0;           // Nm
-const float TORQUE_MAX_CREMALLERA = 90.0;       // Nm
+const float TORQUE_MAX_VOLANTE = 7.0;
+const float TORQUE_MAX_CREMALLERA = 90.0;
 
 float voltaje_suave = 0.0;
 float torque_final_suave = 0.0;
 float torque_final_volante_suave = 0.0;
-const float alphaSuave = 0.01;
+const float alphaSuave = 0.05;
 unsigned long previousSuavizado = 0;
-const unsigned long intervaloSuavizado = 100; // ms
+const unsigned long intervaloSuavizado = 50;
 
 float calcularTorqueVolante(float corriente_final) {
   float torque_final = 1.2 * corriente_final;
@@ -35,15 +34,17 @@ float calcularTorqueVolante(float corriente_final) {
 unsigned long tiempoInicio = 0;
 bool calibrado = false;
 float VREF = 0.0;
-float sensibilidad = 0.0267;
+float sensibilidad = 0.0160;
 float sumaVref = 0.0;
 unsigned long muestrasVref = 0;
 
 int encoderSteps = 100;
+int lastEncoderSteps = 100;
 int lastCLK = HIGH;
 int pulsadorState = HIGH;
 int lastPulsadorState = HIGH;
 int pulsadorValor = 0;
+int signoTorque = 0;
 
 const uint8_t KERNEL_MEDIANA = 3;
 float bufferMedianaVoltaje[KERNEL_MEDIANA] = {0.0};
@@ -100,7 +101,7 @@ void setup() {
   pinMode(ENCODER_SW, INPUT_PULLUP);
   lastCLK = digitalRead(ENCODER_CLK);
 
-  Serial.println("⚙️ Calibrando VREF durante 10 segundos, mantén el motor en idle...");
+  Serial.println("\u2699\ufe0f Calibrando VREF durante 10 segundos, mant\u00e9n el motor en idle...");
   tiempoInicio = millis();
 
   CAN_cfg.speed = CAN_SPEED_250KBPS;
@@ -121,10 +122,10 @@ void loop() {
     if (currentMillis - tiempoInicio >= TIEMPO_CALIBRACION_MS) {
       VREF = sumaVref / muestrasVref;
       calibrado = true;
-      Serial.print("✅ Calibración completada. VREF = ");
+      Serial.print("\u2705 Calibraci\u00f3n completada. VREF = ");
       Serial.print(VREF, 4);
       Serial.println(" V");
-      Serial.println("V_hall(V),MotorDuty(%),I_CAN(A),V_CAN(V),SwitchPos,Temp(°C),DirAngle(bits),Mapa,Error,EncoderSteps,Pulsador,V_final(V),I_final(A),Torque_final(N·m),Torque_volante(N·m),Voltaje_suave(V),Torque_final_suave(N·m),Torque_volante_suave(N·m)");
+      Serial.println("V_hall(V),MotorDuty(%),I_CAN(A),V_CAN(V),SwitchPos,Temp(\u00b0C),DirAngle(bits),Mapa,Error,EncoderSteps,Pulsador,V_final(V),I_final(A),Torque_final(N\u00b7m),Torque_volante(N\u00b7m),Voltaje_suave(V),Torque_final_suave(N\u00b7m),Torque_volante_suave(N\u00b7m)");
       delay(1000);
     }
     return;
@@ -178,8 +179,13 @@ void loop() {
     float voltaje_final = voltajeIIR;
 
     float corriente_final = (voltaje_final - VREF) / sensibilidad;
-    float torque_final = 1.2 * corriente_final;
-    float torque_final_volante = calcularTorqueVolante(corriente_final);
+
+    if (encoderSteps > lastEncoderSteps) signoTorque = +1;
+    else if (encoderSteps < lastEncoderSteps) signoTorque = -1;
+    lastEncoderSteps = encoderSteps;
+
+    float torque_final = signoTorque * 1.2 * fabs(corriente_final);
+    float torque_final_volante = calcularTorqueVolante(torque_final);
 
     if (currentMillis - previousSuavizado >= intervaloSuavizado) {
       previousSuavizado = currentMillis;

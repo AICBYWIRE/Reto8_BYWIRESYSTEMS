@@ -6,6 +6,7 @@
 #include <SPI.h>
 #include <SD.h>
 
+// Pines
 #define VOLTAJE_HALL     35
 #define VOLTAJE_BATERIA  34
 #define ENCODER_CLK      32
@@ -16,12 +17,18 @@
 const float DIVISOR_FACTOR = 5.057;
 
 // === Torque máximo del volante y cremallera ===
-const float TORQUE_MAX_VOLANTE = 3.0;          // Nm
-const float TORQUE_MAX_CREMALLERA = 90.0;      // Nm
+const float TORQUE_MAX_VOLANTE = 7.0;           // Nm
+const float TORQUE_MAX_CREMALLERA = 90.0;       // Nm
+
+// === Variables suavizadas tipo multímetro ===
+float voltaje_suave = 0.0;
+float torque_final_suave = 0.0;
+float torque_final_volante_suave = 0.0;
+const float alphaSuave = 0.02;
 
 // === Función de cálculo de par en el volante ===
 float calcularTorqueVolante(float corriente_final) {
-  float torque_final = 1.2 * corriente_final; // Ajustable
+  float torque_final = 1.2 * corriente_final;
   float torque_final_volante = torque_final * (TORQUE_MAX_VOLANTE / TORQUE_MAX_CREMALLERA);
   return constrain(torque_final_volante, -TORQUE_MAX_VOLANTE, TORQUE_MAX_VOLANTE);
 }
@@ -118,7 +125,7 @@ void loop() {
       Serial.print("✅ Calibración completada. VREF = ");
       Serial.print(VREF, 4);
       Serial.println(" V");
-      Serial.println("V_hall(V),MotorDuty(%),I_CAN(A),V_CAN(V),SwitchPos,Temp(°C),DirAngle(bits),Mapa,Error,EncoderSteps,Pulsador,V_final(V),I_final(A),Torque_final(N·m),Torque_volante(N·m)");
+      Serial.println("V_hall(V),MotorDuty(%),I_CAN(A),V_CAN(V),SwitchPos,Temp(°C),DirAngle(bits),Mapa,Error,EncoderSteps,Pulsador,V_final(V),I_final(A),Torque_final(N·m),Torque_volante(N·m),Voltaje_suave(V),Torque_final_suave(N·m),Torque_volante_suave(N·m)");
       delay(1000);
     }
     return;
@@ -144,7 +151,7 @@ void loop() {
 
     int currentCLK = digitalRead(ENCODER_CLK);
     if (currentCLK != lastCLK && currentCLK == LOW) {
-      encoderSteps += (digitalRead(ENCODER_DT) != currentCLK) ? 20 : -20;
+      encoderSteps += (digitalRead(ENCODER_DT) != currentCLK) ? 5 : -5;
       encoderSteps = constrain(encoderSteps, 10, 250);
     }
     lastCLK = currentCLK;
@@ -175,6 +182,11 @@ void loop() {
     float torque_final = 1.2 * corriente_final;
     float torque_final_volante = calcularTorqueVolante(corriente_final);
 
+    // === Suavizados tipo multímetro ===
+    voltaje_suave = alphaSuave * voltaje + (1.0 - alphaSuave) * voltaje_suave;
+    torque_final_suave = alphaSuave * torque_final + (1.0 - alphaSuave) * torque_final_suave;
+    torque_final_volante_suave = alphaSuave * torque_final_volante + (1.0 - alphaSuave) * torque_final_volante_suave;
+
     CAN_frame_t tx_frame;
     tx_frame.FIR.B.FF = CAN_frame_std;
     tx_frame.MsgID = 0x298;
@@ -184,20 +196,23 @@ void loop() {
     for (int i = 2; i < 8; i++) tx_frame.data.u8[i] = 0x00;
     ESP32Can.CANWriteFrame(&tx_frame);
 
-    Serial.print(voltaje, 4);             Serial.print(",");
-    Serial.print(last_duty);              Serial.print(",");
-    Serial.print(last_corriente);         Serial.print(",");
-    Serial.print(last_voltaje_CAN, 1);    Serial.print(",");
-    Serial.print(last_switch);            Serial.print(",");
-    Serial.print(last_temp);              Serial.print(",");
-    Serial.print(last_angle_dir);         Serial.print(",");
-    Serial.print(last_mapa);              Serial.print(",");
-    Serial.print(last_error);             Serial.print(",");
-    Serial.print(encoderSteps);           Serial.print(",");
-    Serial.print(pulsadorValor);          Serial.print(",");
-    Serial.print(voltaje_final, 4);       Serial.print(",");
-    Serial.print(corriente_final, 4);     Serial.print(",");
-    Serial.print(torque_final, 4);        Serial.print(",");
-    Serial.println(torque_final_volante, 4);
+    Serial.print(voltaje, 4);                  Serial.print(",");
+    Serial.print(last_duty);                   Serial.print(",");
+    Serial.print(last_corriente);              Serial.print(",");
+    Serial.print(last_voltaje_CAN, 1);         Serial.print(",");
+    Serial.print(last_switch);                 Serial.print(",");
+    Serial.print(last_temp);                   Serial.print(",");
+    Serial.print(last_angle_dir);              Serial.print(",");
+    Serial.print(last_mapa);                   Serial.print(",");
+    Serial.print(last_error);                  Serial.print(",");
+    Serial.print(encoderSteps);                Serial.print(",");
+    Serial.print(pulsadorValor);               Serial.print(",");
+    Serial.print(voltaje_final, 4);            Serial.print(",");
+    Serial.print(corriente_final, 4);          Serial.print(",");
+    Serial.print(torque_final, 4);             Serial.print(",");
+    Serial.print(torque_final_volante, 4);     Serial.print(",");
+    Serial.print(voltaje_suave, 4);            Serial.print(",");
+    Serial.print(torque_final_suave, 4);       Serial.print(",");
+    Serial.println(torque_final_volante_suave, 4);
   }
 }

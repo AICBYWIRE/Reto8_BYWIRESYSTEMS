@@ -16,17 +16,16 @@
 #define TIEMPO_CALIBRACION_MS 10000
 const float DIVISOR_FACTOR = 5.057;
 
-// === Torque máximo del volante y cremallera ===
 const float TORQUE_MAX_VOLANTE = 7.0;           // Nm
 const float TORQUE_MAX_CREMALLERA = 90.0;       // Nm
 
-// === Variables suavizadas tipo multímetro ===
 float voltaje_suave = 0.0;
 float torque_final_suave = 0.0;
 float torque_final_volante_suave = 0.0;
-const float alphaSuave = 0.02;
+const float alphaSuave = 0.01;
+unsigned long previousSuavizado = 0;
+const unsigned long intervaloSuavizado = 100; // ms
 
-// === Función de cálculo de par en el volante ===
 float calcularTorqueVolante(float corriente_final) {
   float torque_final = 1.2 * corriente_final;
   float torque_final_volante = torque_final * (TORQUE_MAX_VOLANTE / TORQUE_MAX_CREMALLERA);
@@ -182,10 +181,12 @@ void loop() {
     float torque_final = 1.2 * corriente_final;
     float torque_final_volante = calcularTorqueVolante(corriente_final);
 
-    // === Suavizados tipo multímetro ===
-    voltaje_suave = alphaSuave * voltaje + (1.0 - alphaSuave) * voltaje_suave;
-    torque_final_suave = alphaSuave * torque_final + (1.0 - alphaSuave) * torque_final_suave;
-    torque_final_volante_suave = alphaSuave * torque_final_volante + (1.0 - alphaSuave) * torque_final_volante_suave;
+    if (currentMillis - previousSuavizado >= intervaloSuavizado) {
+      previousSuavizado = currentMillis;
+      voltaje_suave = alphaSuave * voltaje_final + (1.0 - alphaSuave) * voltaje_suave;
+      torque_final_suave = alphaSuave * torque_final + (1.0 - alphaSuave) * torque_final_suave;
+      torque_final_volante_suave = alphaSuave * torque_final_volante + (1.0 - alphaSuave) * torque_final_volante_suave;
+    }
 
     CAN_frame_t tx_frame;
     tx_frame.FIR.B.FF = CAN_frame_std;

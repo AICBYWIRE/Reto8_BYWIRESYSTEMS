@@ -5,12 +5,26 @@
 #include <CAN_config.h>
 #include <SPI.h>
 #include <SD.h>
+#include <Dynamixel2Arduino.h>
 
 #define VOLTAJE_HALL     35
 #define VOLTAJE_BATERIA  34
 #define ENCODER_CLK      32
 #define ENCODER_DT       33
 #define ENCODER_SW       25
+
+#define RS485_TX_PIN 22
+#define RS485_RX_PIN 21
+#define RS485_EN_PIN 17   // /RE
+#define RS485_SE_PIN 19   // /SHDN
+#define PIN_5V_EN    16   // Step-up 5 V
+
+HardwareSerial DXL_SERIAL(2);
+Dynamixel2Arduino dxl(DXL_SERIAL, RS485_EN_PIN);
+
+const float DXL_PROTOCOL_VERSION = 2.0;
+const uint32_t DXL_BAUDRATE = 57600;
+const uint8_t DXL_ID = 1;
 
 #define TIEMPO_CALIBRACION_MS 10000
 const float DIVISOR_FACTOR = 5.057;
@@ -88,20 +102,39 @@ float medianaN(float* arr, uint8_t size) {
 }
 
 void setup() {
-  pinMode(PIN_5V_EN, OUTPUT);
-  digitalWrite(PIN_5V_EN, HIGH);
-  pinMode(CAN_SE_PIN, OUTPUT);
-  digitalWrite(CAN_SE_PIN, LOW);
+  // Alimentación Dynamixel
+  pinMode(PIN_5V_EN, OUTPUT);      digitalWrite(PIN_5V_EN, HIGH);
+  pinMode(RS485_EN_PIN, OUTPUT);  digitalWrite(RS485_EN_PIN, LOW);
+  pinMode(RS485_SE_PIN, OUTPUT);  digitalWrite(RS485_SE_PIN, HIGH);
+  delay(100);
+
+  // Inicialización Dynamixel
+  DXL_SERIAL.begin(DXL_BAUDRATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+  dxl.begin();
+  dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
 
   Serial.begin(921600);
   analogReadResolution(12);
+
+  if (dxl.ping(DXL_ID)) {
+    Serial.println("✅ Dynamixel detectado. Configurando modo corriente...");
+    dxl.torqueOff(DXL_ID);
+    dxl.setOperatingMode(DXL_ID, OP_CURRENT);
+    dxl.torqueOn(DXL_ID);
+  } else {
+    Serial.println("❌ Dynamixel no responde. Código bloqueado.");
+    while (true);
+  }
+
+  pinMode(CAN_SE_PIN, OUTPUT);
+  digitalWrite(CAN_SE_PIN, LOW);
 
   pinMode(ENCODER_CLK, INPUT);
   pinMode(ENCODER_DT, INPUT);
   pinMode(ENCODER_SW, INPUT_PULLUP);
   lastCLK = digitalRead(ENCODER_CLK);
 
-  Serial.println("\u2699\ufe0f Calibrando VREF durante 10 segundos, mant\u00e9n el motor en idle...");
+  Serial.println("⚙️ Calibrando VREF durante 10 segundos, mantén el motor en idle...");
   tiempoInicio = millis();
 
   CAN_cfg.speed = CAN_SPEED_250KBPS;
@@ -122,10 +155,10 @@ void loop() {
     if (currentMillis - tiempoInicio >= TIEMPO_CALIBRACION_MS) {
       VREF = sumaVref / muestrasVref;
       calibrado = true;
-      Serial.print("\u2705 Calibraci\u00f3n completada. VREF = ");
+      Serial.print("✅ Calibración completada. VREF = ");
       Serial.print(VREF, 4);
       Serial.println(" V");
-      Serial.println("V_hall(V),MotorDuty(%),I_CAN(A),V_CAN(V),SwitchPos,Temp(\u00b0C),DirAngle(bits),Mapa,Error,EncoderSteps,Pulsador,V_final(V),I_final(A),Torque_final(N\u00b7m),Torque_volante(N\u00b7m),Voltaje_suave(V),Torque_final_suave(N\u00b7m),Torque_volante_suave(N\u00b7m)");
+      Serial.println("V_hall(V),MotorDuty(%),I_CAN(A),V_CAN(V),SwitchPos,Temp(°C),DirAngle(bits),Mapa,Error,EncoderSteps,Pulsador,V_final(V),I_final(A),Torque_final(N·m),Torque_volante(N·m),Voltaje_suave(V),Torque_final_suave(N·m),Torque_volante_suave(N·m),I_Dynamixel(mA)");
       delay(1000);
     }
     return;
@@ -151,7 +184,7 @@ void loop() {
 
     int currentCLK = digitalRead(ENCODER_CLK);
     if (currentCLK != lastCLK && currentCLK == LOW) {
-      encoderSteps += (digitalRead(ENCODER_DT) != currentCLK) ? 5 : -5;
+      encoderSteps += (digitalRead(ENCODER_DT) != currentCLK) ? 30 : -30;
       encoderSteps = constrain(encoderSteps, 10, 250);
     }
     lastCLK = currentCLK;
@@ -194,6 +227,10 @@ void loop() {
       torque_final_volante_suave = alphaSuave * torque_final_volante + (1.0 - alphaSuave) * torque_final_volante_suave;
     }
 
+    int16_t corriente_dxl_mA = (torque_final_volante_suave / TORQUE_MAX_VOLANTE) * 1193;
+    corriente_dxl_mA = constrain(corriente_dxl_mA, -1193, 1193);
+    dxl.setGoalCurrent(DXL_ID, corriente_dxl_mA, UNIT_MILLI_AMPERE);
+
     CAN_frame_t tx_frame;
     tx_frame.FIR.B.FF = CAN_frame_std;
     tx_frame.MsgID = 0x298;
@@ -220,6 +257,7 @@ void loop() {
     Serial.print(torque_final_volante, 4);     Serial.print(",");
     Serial.print(voltaje_suave, 4);            Serial.print(",");
     Serial.print(torque_final_suave, 4);       Serial.print(",");
-    Serial.println(torque_final_volante_suave, 4);
+    Serial.print(torque_final_volante_suave, 4);Serial.print(",");
+    Serial.println(corriente_dxl_mA);          // nueva columna
   }
 }

@@ -21,7 +21,6 @@
 
 HardwareSerial DXL_SERIAL(2);
 Dynamixel2Arduino dxl(DXL_SERIAL, RS485_EN_PIN);
-
 const float DXL_PROTOCOL_VERSION = 2.0;
 const uint32_t DXL_BAUDRATE = 57600;
 const uint8_t DXL_ID = 1;
@@ -52,8 +51,6 @@ float sensibilidad = 0.0160;
 float sumaVref = 0.0;
 unsigned long muestrasVref = 0;
 
-int encoderSteps = 100;
-int lastEncoderSteps = 100;
 int lastCLK = HIGH;
 int pulsadorState = HIGH;
 int lastPulsadorState = HIGH;
@@ -86,6 +83,8 @@ uint8_t last_angle_dir = 0;
 uint8_t last_mapa = 0;
 uint8_t last_error = 0;
 
+int32_t pos_offset_dyna = 0;
+
 float medianaN(float* arr, uint8_t size) {
   float temp[size];
   memcpy(temp, arr, size * sizeof(float));
@@ -102,13 +101,11 @@ float medianaN(float* arr, uint8_t size) {
 }
 
 void setup() {
-  // Alimentación Dynamixel
   pinMode(PIN_5V_EN, OUTPUT);      digitalWrite(PIN_5V_EN, HIGH);
   pinMode(RS485_EN_PIN, OUTPUT);  digitalWrite(RS485_EN_PIN, LOW);
   pinMode(RS485_SE_PIN, OUTPUT);  digitalWrite(RS485_SE_PIN, HIGH);
   delay(100);
 
-  // Inicialización Dynamixel
   DXL_SERIAL.begin(DXL_BAUDRATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
   dxl.begin();
   dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
@@ -117,14 +114,16 @@ void setup() {
   analogReadResolution(12);
 
   if (dxl.ping(DXL_ID)) {
-    Serial.println("✅ Dynamixel detectado. Configurando modo corriente...");
+    Serial.println("✅ Dynamixel detectado. Desactivando torque para pruebas...");
     dxl.torqueOff(DXL_ID);
-    dxl.setOperatingMode(DXL_ID, OP_CURRENT);
-    dxl.torqueOn(DXL_ID);
   } else {
     Serial.println("❌ Dynamixel no responde. Código bloqueado.");
     while (true);
   }
+
+  pos_offset_dyna = dxl.getPresentPosition(DXL_ID);
+  Serial.print("📍 Offset posición inicial: ");
+  Serial.println(pos_offset_dyna);
 
   pinMode(CAN_SE_PIN, OUTPUT);
   digitalWrite(CAN_SE_PIN, LOW);
@@ -158,7 +157,7 @@ void loop() {
       Serial.print("✅ Calibración completada. VREF = ");
       Serial.print(VREF, 4);
       Serial.println(" V");
-      Serial.println("V_hall(V),MotorDuty(%),I_CAN(A),V_CAN(V),SwitchPos,Temp(°C),DirAngle(bits),Mapa,Error,EncoderSteps,Pulsador,V_final(V),I_final(A),Torque_final(N·m),Torque_volante(N·m),Voltaje_suave(V),Torque_final_suave(N·m),Torque_volante_suave(N·m),I_Dynamixel(mA)");
+      Serial.println("V_hall(V),MotorDuty(%),I_CAN(A),V_CAN(V),SwitchPos,Temp(°C),DirAngle(bits),Mapa,Error,DireccionBits,Pulsador,V_final(V),I_final(A),Torque_final(N·m),Torque_volante(N·m),Voltaje_suave(V),Torque_final_suave(N·m),Torque_volante_suave(N·m),I_Dynamixel(mA)");
       delay(1000);
     }
     return;
@@ -181,13 +180,6 @@ void loop() {
         last_error       = rx_frame.data.u8[4];
       }
     }
-
-    int currentCLK = digitalRead(ENCODER_CLK);
-    if (currentCLK != lastCLK && currentCLK == LOW) {
-      encoderSteps += (digitalRead(ENCODER_DT) != currentCLK) ? 30 : -30;
-      encoderSteps = constrain(encoderSteps, 10, 250);
-    }
-    lastCLK = currentCLK;
 
     pulsadorState = digitalRead(ENCODER_SW);
     if (pulsadorState == LOW && lastPulsadorState == HIGH) {
@@ -212,12 +204,7 @@ void loop() {
     float voltaje_final = voltajeIIR;
 
     float corriente_final = (voltaje_final - VREF) / sensibilidad;
-
-    if (encoderSteps > lastEncoderSteps) signoTorque = +1;
-    else if (encoderSteps < lastEncoderSteps) signoTorque = -1;
-    lastEncoderSteps = encoderSteps;
-
-    float torque_final = signoTorque * 1.2 * fabs(corriente_final);
+    float torque_final = 1.2 * corriente_final;
     float torque_final_volante = calcularTorqueVolante(torque_final);
 
     if (currentMillis - previousSuavizado >= intervaloSuavizado) {
@@ -226,6 +213,16 @@ void loop() {
       torque_final_suave = alphaSuave * torque_final + (1.0 - alphaSuave) * torque_final_suave;
       torque_final_volante_suave = alphaSuave * torque_final_volante + (1.0 - alphaSuave) * torque_final_volante_suave;
     }
+
+    int32_t pos_actual = dxl.getPresentPosition(DXL_ID);
+    int32_t delta_pos = pos_actual - pos_offset_dyna;
+    float grados_volante = (delta_pos / 4096.0) * 360.0;
+    grados_volante = constrain(grados_volante, -180.0, 180.0);
+
+    float direccion_bits_f = (grados_volante + 180.0) * ((250.0 - 10.0) / 360.0) + 10.0;
+    direccion_bits_f = constrain(direccion_bits_f, 10.0, 250.0);
+    uint8_t direccion_bits = static_cast<uint8_t>(direccion_bits_f);
+    uint8_t bit_centrado = (abs(grados_volante) < 5.0) ? 1 : 0;
 
     int16_t corriente_dxl_mA = (torque_final_volante_suave / TORQUE_MAX_VOLANTE) * 1193;
     corriente_dxl_mA = constrain(corriente_dxl_mA, -1193, 1193);
@@ -236,8 +233,9 @@ void loop() {
     tx_frame.MsgID = 0x298;
     tx_frame.FIR.B.DLC = 8;
     tx_frame.data.u8[0] = pulsadorValor;
-    tx_frame.data.u8[1] = encoderSteps;
-    for (int i = 2; i < 8; i++) tx_frame.data.u8[i] = 0x00;
+    tx_frame.data.u8[1] = direccion_bits;
+    tx_frame.data.u8[2] = bit_centrado;
+    for (int i = 3; i < 8; i++) tx_frame.data.u8[i] = 0x00;
     ESP32Can.CANWriteFrame(&tx_frame);
 
     Serial.print(voltaje, 4);                  Serial.print(",");
@@ -249,7 +247,7 @@ void loop() {
     Serial.print(last_angle_dir);              Serial.print(",");
     Serial.print(last_mapa);                   Serial.print(",");
     Serial.print(last_error);                  Serial.print(",");
-    Serial.print(encoderSteps);                Serial.print(",");
+    Serial.print(direccion_bits);              Serial.print(",");
     Serial.print(pulsadorValor);               Serial.print(",");
     Serial.print(voltaje_final, 4);            Serial.print(",");
     Serial.print(corriente_final, 4);          Serial.print(",");
@@ -258,6 +256,6 @@ void loop() {
     Serial.print(voltaje_suave, 4);            Serial.print(",");
     Serial.print(torque_final_suave, 4);       Serial.print(",");
     Serial.print(torque_final_volante_suave, 4);Serial.print(",");
-    Serial.println(corriente_dxl_mA);          // nueva columna
+    Serial.println(corriente_dxl_mA);
   }
 }

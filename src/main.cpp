@@ -30,8 +30,8 @@ const float DIVISOR_FACTOR = 5.057;
 
 const float TORQUE_MAX_VOLANTE = 7.0;
 const float TORQUE_MAX_CREMALLERA = 90.0;
-const float TORQUE_LIMIT_VIRTUAL = 0.6;  // Nm de par en los extremos
-const float TORQUE_ZONE_DEG = 10.0;       // Zona de activación de tope (±10° desde el límite)
+const float TORQUE_LIMIT_VIRTUAL = 0.6;
+const float TORQUE_ZONE_DEG = 10.0;
 
 float voltaje_suave = 0.0;
 float torque_final_suave = 0.0;
@@ -39,12 +39,6 @@ float torque_final_volante_suave = 0.0;
 const float alphaSuave = 0.05;
 unsigned long previousSuavizado = 0;
 const unsigned long intervaloSuavizado = 50;
-
-float calcularTorqueVolante(float corriente_final) {
-  float torque_final = 1.2 * corriente_final;
-  float torque_final_volante = torque_final * (TORQUE_MAX_VOLANTE / TORQUE_MAX_CREMALLERA);
-  return constrain(torque_final_volante, -TORQUE_MAX_VOLANTE, TORQUE_MAX_VOLANTE);
-}
 
 unsigned long tiempoInicio = 0;
 bool calibrado = false;
@@ -57,7 +51,6 @@ int lastCLK = HIGH;
 int pulsadorState = HIGH;
 int lastPulsadorState = HIGH;
 int pulsadorValor = 0;
-int signoTorque = 0;
 
 const uint8_t KERNEL_MEDIANA = 3;
 float bufferMedianaVoltaje[KERNEL_MEDIANA] = {0.0};
@@ -86,6 +79,19 @@ uint8_t last_mapa = 0;
 uint8_t last_error = 0;
 
 int32_t pos_offset_dyna = 0;
+float corriente_final = 0.0;
+float torque_final = 0.0;
+float torque_final_volante = 0.0;
+float voltaje_final = 0.0;
+float grados_volante = 0.0;
+uint8_t direccion_bits = 0;
+uint8_t bit_centrado = 0;
+float par_virtual = 0.0;
+
+float calcularTorqueVolante(float corriente) {
+  float torque = 1.2 * corriente;
+  return constrain(torque * (TORQUE_MAX_VOLANTE / TORQUE_MAX_CREMALLERA), -TORQUE_MAX_VOLANTE, TORQUE_MAX_VOLANTE);
+}
 
 float medianaN(float* arr, uint8_t size) {
   float temp[size];
@@ -102,52 +108,119 @@ float medianaN(float* arr, uint8_t size) {
   return temp[size / 2];
 }
 
-void setup() {
-  pinMode(PIN_5V_EN, OUTPUT);      digitalWrite(PIN_5V_EN, HIGH);
-  pinMode(RS485_EN_PIN, OUTPUT);  digitalWrite(RS485_EN_PIN, LOW);
-  pinMode(RS485_SE_PIN, OUTPUT);  digitalWrite(RS485_SE_PIN, HIGH);
-  delay(100);
-
-  DXL_SERIAL.begin(DXL_BAUDRATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
-  dxl.begin();
-  dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
-
-  Serial.begin(921600);
-  analogReadResolution(12);
-
-  if (dxl.ping(DXL_ID)) {
-    Serial.println("✅ Dynamixel detectado. Desactivando torque para pruebas...");
-    dxl.torqueOff(DXL_ID);
-  } else {
-    Serial.println("❌ Dynamixel no responde. Código bloqueado.");
-    while (true);
+void leerCAN() {
+  CAN_frame_t rx_frame;
+  while (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 0) == pdTRUE) {
+    if (rx_frame.MsgID == 0x290) {
+      last_duty        = rx_frame.data.u8[1];
+      last_corriente   = rx_frame.data.u8[2];
+      last_voltaje_CAN = rx_frame.data.u8[3] * 0.1;
+      last_switch      = rx_frame.data.u8[4];
+      last_temp        = rx_frame.data.u8[5];
+    } else if (rx_frame.MsgID == 0x292) {
+      last_angle_dir   = rx_frame.data.u8[0];
+      last_mapa        = rx_frame.data.u8[3];
+      last_error       = rx_frame.data.u8[4];
+    }
   }
+}
 
-  pos_offset_dyna = dxl.getPresentPosition(DXL_ID);
-  Serial.print("📍 Offset posición inicial: ");
-  Serial.println(pos_offset_dyna);
+void leerPulsador() {
+  pulsadorState = digitalRead(ENCODER_SW);
+  if (pulsadorState == LOW && lastPulsadorState == HIGH) {
+    pulsadorValor = (pulsadorValor + 1) % 6;
+  }
+  lastPulsadorState = pulsadorState;
+}
 
-  pinMode(CAN_SE_PIN, OUTPUT);
-  digitalWrite(CAN_SE_PIN, LOW);
+void leerSensorCorriente() {
+  int lecturaADC = analogRead(VOLTAJE_HALL);
+  float voltaje = (lecturaADC / 4095.0) * 3.3;
+  bufferMedianaVoltaje[idxMedianaVoltaje] = voltaje;
+  idxMedianaVoltaje = (idxMedianaVoltaje + 1) % KERNEL_MEDIANA;
+  float voltajeMediana = medianaN(bufferMedianaVoltaje, KERNEL_MEDIANA);
+  sumaMediaVoltaje -= bufferMediaVoltaje[idxMediaVoltaje];
+  bufferMediaVoltaje[idxMediaVoltaje] = voltajeMediana;
+  sumaMediaVoltaje += voltajeMediana;
+  idxMediaVoltaje = (idxMediaVoltaje + 1) % TAM_MEDIA_MOVIL;
+  float voltajeMediaMovil = sumaMediaVoltaje / TAM_MEDIA_MOVIL;
+  voltajeIIR = alphaVoltajeIIR * voltajeMediaMovil + (1.0 - alphaVoltajeIIR) * voltajeIIR;
+  voltaje_final = voltajeIIR;
+  corriente_final = (voltaje_final - VREF) / sensibilidad;
+}
 
-  pinMode(ENCODER_CLK, INPUT);
-  pinMode(ENCODER_DT, INPUT);
-  pinMode(ENCODER_SW, INPUT_PULLUP);
-  lastCLK = digitalRead(ENCODER_CLK);
+void calcularTorque() {
+  torque_final = 1.2 * corriente_final;
+  torque_final_volante = calcularTorqueVolante(torque_final);
+  if (millis() - previousSuavizado >= intervaloSuavizado) {
+    previousSuavizado = millis();
+    voltaje_suave = alphaSuave * voltaje_final + (1.0 - alphaSuave) * voltaje_suave;
+    torque_final_suave = alphaSuave * torque_final + (1.0 - alphaSuave) * torque_final_suave;
+    torque_final_volante_suave = alphaSuave * torque_final_volante + (1.0 - alphaSuave) * torque_final_volante_suave;
+  }
+}
 
-  Serial.println("⚙️ Calibrando VREF durante 10 segundos, mantén el motor en idle...");
-  tiempoInicio = millis();
+void calcularDireccion() {
+  int32_t pos_actual = dxl.getPresentPosition(DXL_ID);
+  int32_t delta_pos = pos_actual - pos_offset_dyna;
+  grados_volante = (delta_pos / 4096.0) * 360.0;
+  grados_volante = constrain(grados_volante, -180.0, 180.0);
+  float direccion_bits_f = (grados_volante + 180.0) * ((250.0 - 10.0) / 360.0) + 10.0;
+  direccion_bits_f = constrain(direccion_bits_f, 10.0, 250.0);
+  direccion_bits = static_cast<uint8_t>(direccion_bits_f);
+  bit_centrado = (abs(grados_volante) < 5.0) ? 1 : 0;
+}
 
-  CAN_cfg.speed = CAN_SPEED_250KBPS;
-  CAN_cfg.tx_pin_id = GPIO_NUM_27;
-  CAN_cfg.rx_pin_id = GPIO_NUM_26;
-  CAN_cfg.rx_queue = xQueueCreate(rx_queue_size, sizeof(CAN_frame_t));
-  ESP32Can.CANInit();
+void aplicarTopeVirtual() {
+  par_virtual = 0.0;
+  if (grados_volante > 180.0 - TORQUE_ZONE_DEG) par_virtual = -TORQUE_LIMIT_VIRTUAL;
+  else if (grados_volante < -180.0 + TORQUE_ZONE_DEG) par_virtual = TORQUE_LIMIT_VIRTUAL;
+  if (abs(par_virtual) > 0.01) {
+    dxl.torqueOn(DXL_ID);
+    int16_t corriente_dxl_mA = (par_virtual / TORQUE_MAX_VOLANTE) * 1193;
+    corriente_dxl_mA = constrain(corriente_dxl_mA, -1193, 1193);
+    dxl.setGoalCurrent(DXL_ID, corriente_dxl_mA, UNIT_MILLI_AMPERE);
+  } else {
+    dxl.torqueOff(DXL_ID);
+  }
+}
+
+void enviarCAN() {
+  CAN_frame_t tx_frame;
+  tx_frame.FIR.B.FF = CAN_frame_std;
+  tx_frame.MsgID = 0x298;
+  tx_frame.FIR.B.DLC = 8;
+  tx_frame.data.u8[0] = pulsadorValor;
+  tx_frame.data.u8[1] = direccion_bits;
+  tx_frame.data.u8[2] = bit_centrado;
+  for (int i = 3; i < 8; i++) tx_frame.data.u8[i] = 0x00;
+  ESP32Can.CANWriteFrame(&tx_frame);
+}
+
+void imprimirDebug() {
+  Serial.print(voltaje_final, 4); Serial.print(",");
+  Serial.print(last_duty); Serial.print(",");
+  Serial.print(last_corriente); Serial.print(",");
+  Serial.print(last_voltaje_CAN, 1); Serial.print(",");
+  Serial.print(last_switch); Serial.print(",");
+  Serial.print(last_temp); Serial.print(",");
+  Serial.print(last_angle_dir); Serial.print(",");
+  Serial.print(last_mapa); Serial.print(",");
+  Serial.print(last_error); Serial.print(",");
+  Serial.print(direccion_bits); Serial.print(",");
+  Serial.print(pulsadorValor); Serial.print(",");
+  Serial.print(voltaje_final, 4); Serial.print(",");
+  Serial.print(corriente_final, 4); Serial.print(",");
+  Serial.print(torque_final, 4); Serial.print(",");
+  Serial.print(torque_final_volante, 4); Serial.print(",");
+  Serial.print(voltaje_suave, 4); Serial.print(",");
+  Serial.print(torque_final_suave, 4); Serial.print(",");
+  Serial.print(torque_final_volante_suave, 4); Serial.print(",");
+  Serial.println((int)((par_virtual / TORQUE_MAX_VOLANTE) * 1193));
 }
 
 void loop() {
   unsigned long currentMillis = millis();
-
   if (!calibrado) {
     int lecturaADC = analogRead(VOLTAJE_HALL);
     float voltaje = (lecturaADC / 4095.0) * 3.3;
@@ -167,109 +240,13 @@ void loop() {
 
   if (currentMillis - previousMedicion >= interval) {
     previousMedicion = currentMillis;
-
-    CAN_frame_t rx_frame;
-    while (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 0) == pdTRUE) {
-      if (rx_frame.MsgID == 0x290) {
-        last_duty        = rx_frame.data.u8[1];
-        last_corriente   = rx_frame.data.u8[2];
-        last_voltaje_CAN = rx_frame.data.u8[3] * 0.1;
-        last_switch      = rx_frame.data.u8[4];
-        last_temp        = rx_frame.data.u8[5];
-      } else if (rx_frame.MsgID == 0x292) {
-        last_angle_dir   = rx_frame.data.u8[0];
-        last_mapa        = rx_frame.data.u8[3];
-        last_error       = rx_frame.data.u8[4];
-      }
-    }
-
-    pulsadorState = digitalRead(ENCODER_SW);
-    if (pulsadorState == LOW && lastPulsadorState == HIGH) {
-      pulsadorValor = (pulsadorValor + 1) % 6;
-    }
-    lastPulsadorState = pulsadorState;
-
-    int lecturaADC = analogRead(VOLTAJE_HALL);
-    float voltaje = (lecturaADC / 4095.0) * 3.3;
-
-    bufferMedianaVoltaje[idxMedianaVoltaje] = voltaje;
-    idxMedianaVoltaje = (idxMedianaVoltaje + 1) % KERNEL_MEDIANA;
-    float voltajeMediana = medianaN(bufferMedianaVoltaje, KERNEL_MEDIANA);
-
-    sumaMediaVoltaje -= bufferMediaVoltaje[idxMediaVoltaje];
-    bufferMediaVoltaje[idxMediaVoltaje] = voltajeMediana;
-    sumaMediaVoltaje += voltajeMediana;
-    idxMediaVoltaje = (idxMediaVoltaje + 1) % TAM_MEDIA_MOVIL;
-    float voltajeMediaMovil = sumaMediaVoltaje / TAM_MEDIA_MOVIL;
-
-    voltajeIIR = alphaVoltajeIIR * voltajeMediaMovil + (1.0 - alphaVoltajeIIR) * voltajeIIR;
-    float voltaje_final = voltajeIIR;
-
-    float corriente_final = (voltaje_final - VREF) / sensibilidad;
-    float torque_final = 1.2 * corriente_final;
-    float torque_final_volante = calcularTorqueVolante(torque_final);
-
-    if (currentMillis - previousSuavizado >= intervaloSuavizado) {
-      previousSuavizado = currentMillis;
-      voltaje_suave = alphaSuave * voltaje_final + (1.0 - alphaSuave) * voltaje_suave;
-      torque_final_suave = alphaSuave * torque_final + (1.0 - alphaSuave) * torque_final_suave;
-      torque_final_volante_suave = alphaSuave * torque_final_volante + (1.0 - alphaSuave) * torque_final_volante_suave;
-    }
-
-    int32_t pos_actual = dxl.getPresentPosition(DXL_ID);
-    int32_t delta_pos = pos_actual - pos_offset_dyna;
-    float grados_volante = (delta_pos / 4096.0) * 360.0;
-    grados_volante = constrain(grados_volante, -180.0, 180.0);
-
-    float direccion_bits_f = (grados_volante + 180.0) * ((250.0 - 10.0) / 360.0) + 10.0;
-    direccion_bits_f = constrain(direccion_bits_f, 10.0, 250.0);
-    uint8_t direccion_bits = static_cast<uint8_t>(direccion_bits_f);
-    uint8_t bit_centrado = (abs(grados_volante) < 5.0) ? 1 : 0;
-
-    float par_virtual = 0.0;
-    if (grados_volante > 180.0 - TORQUE_ZONE_DEG) {
-      par_virtual = -TORQUE_LIMIT_VIRTUAL;
-    } else if (grados_volante < -180.0 + TORQUE_ZONE_DEG) {
-      par_virtual = TORQUE_LIMIT_VIRTUAL;
-    }
-
-    if (abs(par_virtual) > 0.01) {
-      dxl.torqueOn(DXL_ID);
-      int16_t corriente_dxl_mA = (par_virtual / TORQUE_MAX_VOLANTE) * 1193;
-      corriente_dxl_mA = constrain(corriente_dxl_mA, -1193, 1193);
-      dxl.setGoalCurrent(DXL_ID, corriente_dxl_mA, UNIT_MILLI_AMPERE);
-    } else {
-      dxl.torqueOff(DXL_ID);
-    }
-
-    CAN_frame_t tx_frame;
-    tx_frame.FIR.B.FF = CAN_frame_std;
-    tx_frame.MsgID = 0x298;
-    tx_frame.FIR.B.DLC = 8;
-    tx_frame.data.u8[0] = pulsadorValor;
-    tx_frame.data.u8[1] = direccion_bits;
-    tx_frame.data.u8[2] = bit_centrado;
-    for (int i = 3; i < 8; i++) tx_frame.data.u8[i] = 0x00;
-    ESP32Can.CANWriteFrame(&tx_frame);
-
-    Serial.print(voltaje, 4);                  Serial.print(",");
-    Serial.print(last_duty);                   Serial.print(",");
-    Serial.print(last_corriente);              Serial.print(",");
-    Serial.print(last_voltaje_CAN, 1);         Serial.print(",");
-    Serial.print(last_switch);                 Serial.print(",");
-    Serial.print(last_temp);                   Serial.print(",");
-    Serial.print(last_angle_dir);              Serial.print(",");
-    Serial.print(last_mapa);                   Serial.print(",");
-    Serial.print(last_error);                  Serial.print(",");
-    Serial.print(direccion_bits);              Serial.print(",");
-    Serial.print(pulsadorValor);               Serial.print(",");
-    Serial.print(voltaje_final, 4);            Serial.print(",");
-    Serial.print(corriente_final, 4);          Serial.print(",");
-    Serial.print(torque_final, 4);             Serial.print(",");
-    Serial.print(torque_final_volante, 4);     Serial.print(",");
-    Serial.print(voltaje_suave, 4);            Serial.print(",");
-    Serial.print(torque_final_suave, 4);       Serial.print(",");
-    Serial.print(torque_final_volante_suave, 4);Serial.print(",");
-    Serial.println((int)((par_virtual / TORQUE_MAX_VOLANTE) * 1193));
+    leerCAN();
+    leerPulsador();
+    leerSensorCorriente();
+    calcularTorque();
+    calcularDireccion();
+    aplicarTopeVirtual();
+    enviarCAN();
+    imprimirDebug();
   }
 }

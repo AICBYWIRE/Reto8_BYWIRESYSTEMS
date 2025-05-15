@@ -30,6 +30,8 @@ const float DIVISOR_FACTOR = 5.057;
 
 const float TORQUE_MAX_VOLANTE = 7.0;
 const float TORQUE_MAX_CREMALLERA = 90.0;
+const float TORQUE_LIMIT_VIRTUAL = 0.6;  // Nm de par en los extremos
+const float TORQUE_ZONE_DEG = 10.0;       // Zona de activación de tope (±10° desde el límite)
 
 float voltaje_suave = 0.0;
 float torque_final_suave = 0.0;
@@ -224,9 +226,21 @@ void loop() {
     uint8_t direccion_bits = static_cast<uint8_t>(direccion_bits_f);
     uint8_t bit_centrado = (abs(grados_volante) < 5.0) ? 1 : 0;
 
-    int16_t corriente_dxl_mA = (torque_final_volante_suave / TORQUE_MAX_VOLANTE) * 1193;
-    corriente_dxl_mA = constrain(corriente_dxl_mA, -1193, 1193);
-    dxl.setGoalCurrent(DXL_ID, corriente_dxl_mA, UNIT_MILLI_AMPERE);
+    float par_virtual = 0.0;
+    if (grados_volante > 180.0 - TORQUE_ZONE_DEG) {
+      par_virtual = -TORQUE_LIMIT_VIRTUAL;
+    } else if (grados_volante < -180.0 + TORQUE_ZONE_DEG) {
+      par_virtual = TORQUE_LIMIT_VIRTUAL;
+    }
+
+    if (abs(par_virtual) > 0.01) {
+      dxl.torqueOn(DXL_ID);
+      int16_t corriente_dxl_mA = (par_virtual / TORQUE_MAX_VOLANTE) * 1193;
+      corriente_dxl_mA = constrain(corriente_dxl_mA, -1193, 1193);
+      dxl.setGoalCurrent(DXL_ID, corriente_dxl_mA, UNIT_MILLI_AMPERE);
+    } else {
+      dxl.torqueOff(DXL_ID);
+    }
 
     CAN_frame_t tx_frame;
     tx_frame.FIR.B.FF = CAN_frame_std;
@@ -256,6 +270,6 @@ void loop() {
     Serial.print(voltaje_suave, 4);            Serial.print(",");
     Serial.print(torque_final_suave, 4);       Serial.print(",");
     Serial.print(torque_final_volante_suave, 4);Serial.print(",");
-    Serial.println(corriente_dxl_mA);
+    Serial.println((int)((par_virtual / TORQUE_MAX_VOLANTE) * 1193));
   }
 }

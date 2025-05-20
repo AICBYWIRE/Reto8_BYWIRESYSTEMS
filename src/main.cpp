@@ -1,6 +1,3 @@
-// Código completo con rango de volante configurable
-// y actualización automática de límites, escalado CAN y tope virtual
-
 #include <Arduino.h>
 #include "config.h"
 #include <HardwareSerial.h>
@@ -30,7 +27,7 @@ const uint8_t DXL_ID = 1;
 
 #define TIEMPO_CALIBRACION_MS 10000
 
-const float VOLANTE_RANGO_GRADOS = 900.0; //
+const float VOLANTE_RANGO_GRADOS = 900.0;
 const float TORQUE_MAX_VOLANTE = 7.0;
 const float TORQUE_MAX_CREMALLERA = 90.0;
 const float TORQUE_LIMIT_VIRTUAL = 0.6;
@@ -96,6 +93,7 @@ float grados_volante = 0.0;
 uint8_t direccion_bits = 0;
 uint8_t bit_centrado = 0;
 float par_virtual = 0.0;
+int signoTorque = 0;
 
 float calcularTorqueVolante(float corriente) {
   float torque = 1.2 * corriente;
@@ -142,30 +140,56 @@ void leerPulsador() {
     velocidad_simulada = constrain(velocidad_simulada, VEL_MIN, VEL_MAX);
   }
   lastCLK = currentCLK;
+
   pulsadorState = digitalRead(ENCODER_SW);
-  if (pulsadorState == LOW && lastPulsadorState == HIGH) pulsadorValor = (pulsadorValor + 1) % 6;
+  if (pulsadorState == LOW && lastPulsadorState == HIGH)
+    pulsadorValor = (pulsadorValor + 1) % 6;
+
   lastPulsadorState = pulsadorState;
 }
 
 void leerSensorCorriente() {
   int lecturaADC = analogRead(VOLTAJE_HALL);
   float voltaje = (lecturaADC / 4095.0) * 3.3;
+
   bufferMedianaVoltaje[idxMedianaVoltaje] = voltaje;
   idxMedianaVoltaje = (idxMedianaVoltaje + 1) % KERNEL_MEDIANA;
   float voltajeMediana = medianaN(bufferMedianaVoltaje, KERNEL_MEDIANA);
+
   sumaMediaVoltaje -= bufferMediaVoltaje[idxMediaVoltaje];
   bufferMediaVoltaje[idxMediaVoltaje] = voltajeMediana;
   sumaMediaVoltaje += voltajeMediana;
   idxMediaVoltaje = (idxMediaVoltaje + 1) % TAM_MEDIA_MOVIL;
+
   float voltajeMediaMovil = sumaMediaVoltaje / TAM_MEDIA_MOVIL;
   voltajeIIR = alphaVoltajeIIR * voltajeMediaMovil + (1.0 - alphaVoltajeIIR) * voltajeIIR;
   voltaje_final = voltajeIIR;
+
   corriente_final = (voltaje_final - VREF) / sensibilidad;
 }
 
+void calcularDireccion() {
+  static float grados_volante_anterior = 0.0;
+  int32_t pos_actual = dxl.getPresentPosition(DXL_ID);
+  int32_t delta_pos = pos_actual - pos_offset_dyna;
+
+  grados_volante = (delta_pos / 4096.0) * 360.0;
+  grados_volante = constrain(grados_volante, -VOLANTE_RANGO_GRADOS / 2, VOLANTE_RANGO_GRADOS / 2);
+
+  float direccion_bits_f = (grados_volante + VOLANTE_RANGO_GRADOS / 2) * ((250.0 - 10.0) / VOLANTE_RANGO_GRADOS) + 10.0;
+  direccion_bits_f = constrain(direccion_bits_f, 10.0, 250.0);
+  direccion_bits = static_cast<uint8_t>(direccion_bits_f);
+  bit_centrado = (abs(grados_volante) < 5.0) ? 1 : 0;
+
+  if (grados_volante > grados_volante_anterior) signoTorque = +1;
+  else if (grados_volante < grados_volante_anterior) signoTorque = -1;
+  grados_volante_anterior = grados_volante;
+}
+
 void calcularTorque() {
-  torque_final = 1.2 * corriente_final;
+  torque_final = signoTorque * 1.2 * fabs(corriente_final);
   torque_final_volante = calcularTorqueVolante(torque_final);
+
   if (millis() - previousSuavizado >= intervaloSuavizado) {
     previousSuavizado = millis();
     voltaje_suave = alphaSuave * voltaje_final + (1.0 - alphaSuave) * voltaje_suave;
@@ -173,29 +197,24 @@ void calcularTorque() {
     torque_final_volante_suave = alphaSuave * torque_final_volante + (1.0 - alphaSuave) * torque_final_volante_suave;
   }
 }
-
-void calcularDireccion() {
-  int32_t pos_actual = dxl.getPresentPosition(DXL_ID);
-  int32_t delta_pos = pos_actual - pos_offset_dyna;
-  grados_volante = (delta_pos / 4096.0) * 360.0;
-  grados_volante = constrain(grados_volante, -VOLANTE_RANGO_GRADOS / 2, VOLANTE_RANGO_GRADOS / 2);
-  float direccion_bits_f = (grados_volante + VOLANTE_RANGO_GRADOS / 2) * ((250.0 - 10.0) / VOLANTE_RANGO_GRADOS) + 10.0;
-  direccion_bits_f = constrain(direccion_bits_f, 10.0, 250.0);
-  direccion_bits = static_cast<uint8_t>(direccion_bits_f);
-  bit_centrado = (abs(grados_volante) < 5.0) ? 1 : 0;
-}
-
 void aplicarTopeVirtual() {
   float torque_centrado_virtual = -RIGIDEZ_CENTRADO_VEL * velocidad_simulada * grados_volante;
-  if (grados_volante > VOLANTE_RANGO_GRADOS / 2 - TORQUE_ZONE_DEG) par_virtual = -TORQUE_LIMIT_VIRTUAL;
-  else if (grados_volante < -VOLANTE_RANGO_GRADOS / 2 + TORQUE_ZONE_DEG) par_virtual = TORQUE_LIMIT_VIRTUAL;
-  else par_virtual = torque_centrado_virtual;
+
+  if (grados_volante > VOLANTE_RANGO_GRADOS / 2 - TORQUE_ZONE_DEG)
+    par_virtual = -TORQUE_LIMIT_VIRTUAL;
+  else if (grados_volante < -VOLANTE_RANGO_GRADOS / 2 + TORQUE_ZONE_DEG)
+    par_virtual = TORQUE_LIMIT_VIRTUAL;
+  else
+    par_virtual = torque_centrado_virtual;
+
   if (abs(par_virtual) > 0.01) {
     dxl.torqueOn(DXL_ID);
     int16_t corriente_dxl_mA = (par_virtual / TORQUE_MAX_VOLANTE) * 1193;
     corriente_dxl_mA = constrain(corriente_dxl_mA, -1193, 1193);
     dxl.setGoalCurrent(DXL_ID, corriente_dxl_mA, UNIT_MILLI_AMPERE);
-  } else dxl.torqueOff(DXL_ID);
+  } else {
+    dxl.torqueOff(DXL_ID);
+  }
 }
 
 void enviarCAN() {
@@ -238,11 +257,14 @@ void setup() {
   pinMode(RS485_EN_PIN, OUTPUT);  digitalWrite(RS485_EN_PIN, LOW);
   pinMode(RS485_SE_PIN, OUTPUT);  digitalWrite(RS485_SE_PIN, HIGH);
   delay(100);
+
   DXL_SERIAL.begin(DXL_BAUDRATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
   dxl.begin();
   dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
+
   Serial.begin(921600);
   analogReadResolution(12);
+
   if (dxl.ping(DXL_ID)) {
     Serial.println("✅ Dynamixel detectado.");
     dxl.torqueOff(DXL_ID);
@@ -250,13 +272,19 @@ void setup() {
     Serial.println("❌ Dynamixel no responde.");
     while (true);
   }
+
   pos_offset_dyna = dxl.getPresentPosition(DXL_ID);
   Serial.print("📍 Offset posición inicial: "); Serial.println(pos_offset_dyna);
+
   pinMode(CAN_SE_PIN, OUTPUT); digitalWrite(CAN_SE_PIN, LOW);
-  pinMode(ENCODER_CLK, INPUT); pinMode(ENCODER_DT, INPUT);
-  pinMode(ENCODER_SW, INPUT_PULLUP); lastCLK = digitalRead(ENCODER_CLK);
+  pinMode(ENCODER_CLK, INPUT);
+  pinMode(ENCODER_DT, INPUT);
+  pinMode(ENCODER_SW, INPUT_PULLUP);
+  lastCLK = digitalRead(ENCODER_CLK);
+
   Serial.println("⚙️ Calibrando VREF durante 10 segundos, mantén el motor en idle...");
   tiempoInicio = millis();
+
   CAN_cfg.speed = CAN_SPEED_250KBPS;
   CAN_cfg.tx_pin_id = GPIO_NUM_27;
   CAN_cfg.rx_pin_id = GPIO_NUM_26;
@@ -266,22 +294,32 @@ void setup() {
 
 void loop() {
   unsigned long currentMillis = millis();
+
   if (!calibrado) {
     int lecturaADC = analogRead(VOLTAJE_HALL);
     float voltaje = (lecturaADC / 4095.0) * 3.3;
-    sumaVref += voltaje; muestrasVref++;
+    sumaVref += voltaje;
+    muestrasVref++;
+
     if (currentMillis - tiempoInicio >= TIEMPO_CALIBRACION_MS) {
-      VREF = sumaVref / muestrasVref; calibrado = true;
+      VREF = sumaVref / muestrasVref;
+      calibrado = true;
       Serial.print("✅ Calibración completada. VREF = "); Serial.print(VREF, 4); Serial.println(" V");
       Serial.println("V_hall(V),MotorDuty(%),I_CAN(A),V_CAN(V),SwitchPos,Temp(°C),DirAngle(bits),Mapa,Error,DireccionBits,Pulsador,V_final(V),I_final(A),Torque_final(N·m),Torque_volante(N·m),Voltaje_suave(V),Torque_final_suave(N·m),Torque_volante_suave(N·m),I_Dynamixel(mA)");
       delay(1000);
     }
     return;
   }
+
   if (currentMillis - previousMedicion >= interval) {
     previousMedicion = currentMillis;
-    leerCAN(); leerPulsador(); leerSensorCorriente();
-    calcularTorque(); calcularDireccion(); aplicarTopeVirtual();
-    enviarCAN(); imprimirDebug();
+    leerCAN();
+    leerPulsador();
+    leerSensorCorriente();
+    calcularDireccion();
+    calcularTorque();
+    aplicarTopeVirtual();
+    enviarCAN();
+    imprimirDebug();
   }
 }

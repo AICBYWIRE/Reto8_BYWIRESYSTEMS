@@ -27,10 +27,10 @@ const uint8_t DXL_ID = 1;
 
 #define TIEMPO_CALIBRACION_MS 10000
 
-const float VOLANTE_RANGO_GRADOS = 900.0;
+const float VOLANTE_RANGO_GRADOS = 540.0;
 const float TORQUE_MAX_VOLANTE = 7.0;
 const float TORQUE_MAX_CREMALLERA = 90.0;
-const float TORQUE_LIMIT_VIRTUAL = 0.6;
+const float TORQUE_LIMIT_VIRTUAL = 2;
 const float TORQUE_ZONE_DEG = 10.0;
 const float RIGIDEZ_CENTRADO_VEL = 0.00001;
 
@@ -94,6 +94,10 @@ uint8_t direccion_bits = 0;
 uint8_t bit_centrado = 0;
 float par_virtual = 0.0;
 int signoTorque = 0;
+
+// CONTROL MANUAL DESDE SERIAL
+bool torqueActivado = true;
+bool autocentradoActivado = false;
 
 float calcularTorqueVolante(float corriente) {
   float torque = 1.2 * corriente;
@@ -187,7 +191,7 @@ void calcularDireccion() {
 }
 
 void calcularTorque() {
-  torque_final = signoTorque * 1.2 * fabs(corriente_final);
+  torque_final = -signoTorque * 3 * fabs(corriente_final);
   torque_final_volante = calcularTorqueVolante(torque_final);
 
   if (millis() - previousSuavizado >= intervaloSuavizado) {
@@ -197,8 +201,9 @@ void calcularTorque() {
     torque_final_volante_suave = alphaSuave * torque_final_volante + (1.0 - alphaSuave) * torque_final_volante_suave;
   }
 }
+
 void aplicarTopeVirtual() {
-  float torque_centrado_virtual = -RIGIDEZ_CENTRADO_VEL * velocidad_simulada * grados_volante;
+  float torque_centrado_virtual = autocentradoActivado ? -RIGIDEZ_CENTRADO_VEL * velocidad_simulada * grados_volante : 0.0;
 
   if (grados_volante > VOLANTE_RANGO_GRADOS / 2 - TORQUE_ZONE_DEG)
     par_virtual = -TORQUE_LIMIT_VIRTUAL;
@@ -207,9 +212,10 @@ void aplicarTopeVirtual() {
   else
     par_virtual = torque_centrado_virtual;
 
-  if (abs(par_virtual) > 0.01) {
+  if (torqueActivado) {
     dxl.torqueOn(DXL_ID);
-    int16_t corriente_dxl_mA = (par_virtual / TORQUE_MAX_VOLANTE) * 1193;
+    float torque_total = torque_final_volante_suave + par_virtual;
+    int16_t corriente_dxl_mA = (torque_total / TORQUE_MAX_VOLANTE) * 1193;
     corriente_dxl_mA = constrain(corriente_dxl_mA, -1193, 1193);
     dxl.setGoalCurrent(DXL_ID, corriente_dxl_mA, UNIT_MILLI_AMPERE);
   } else {
@@ -252,6 +258,20 @@ void imprimirDebug() {
   Serial.println((int)((par_virtual / TORQUE_MAX_VOLANTE) * 1193));
 }
 
+void serialControlModoTorque() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '1') {
+      torqueActivado = !torqueActivado;
+      Serial.print("🔧 Torque "); Serial.println(torqueActivado ? "ACTIVADO" : "DESACTIVADO");
+    }
+    if (c == '2') {
+      autocentradoActivado = !autocentradoActivado;
+      Serial.print("📐 Autocentrado "); Serial.println(autocentradoActivado ? "ACTIVADO" : "DESACTIVADO");
+    }
+  }
+}
+
 void setup() {
   pinMode(PIN_5V_EN, OUTPUT);      digitalWrite(PIN_5V_EN, HIGH);
   pinMode(RS485_EN_PIN, OUTPUT);  digitalWrite(RS485_EN_PIN, LOW);
@@ -259,8 +279,7 @@ void setup() {
   delay(100);
 
   DXL_SERIAL.begin(DXL_BAUDRATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
-  dxl.begin();
-  dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
+  dxl.begin(); dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
 
   Serial.begin(921600);
   analogReadResolution(12);
@@ -322,4 +341,6 @@ void loop() {
     enviarCAN();
     imprimirDebug();
   }
+
+  serialControlModoTorque();
 }

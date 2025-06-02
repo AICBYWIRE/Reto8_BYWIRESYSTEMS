@@ -25,15 +25,14 @@ const float DXL_PROTOCOL_VERSION = 2.0;
 const uint32_t DXL_BAUDRATE = 57600;
 const uint8_t DXL_ID = 1;
 
-#define TIEMPO_CALIBRACION_MS 10000
+#define TIEMPO_CALIBRACION_MS 1000
 
-const float VOLANTE_RANGO_GRADOS = 540.0;
+const float VOLANTE_RANGO_GRADOS = 500.0;
 const float TORQUE_MAX_VOLANTE = 7.0;
-const float TORQUE_MAX_CREMALLERA = 90.0;
+const float TORQUE_MAX_CREMALLERA = 50.0;
 const float TORQUE_LIMIT_VIRTUAL = 2;
 const float TORQUE_ZONE_DEG = 10.0;
-const float RIGIDEZ_CENTRADO_VEL = 0.00001;
-
+const float RIGIDEZ_CENTRADO_VEL = 0.1;
 int velocidad_simulada = 0;
 const int VEL_MIN = 0;
 const int VEL_MAX = 255;
@@ -62,7 +61,7 @@ const uint8_t KERNEL_MEDIANA = 3;
 float bufferMedianaVoltaje[KERNEL_MEDIANA] = {0.0};
 uint8_t idxMedianaVoltaje = 0;
 
-const uint8_t TAM_MEDIA_MOVIL = 10;
+const uint8_t TAM_MEDIA_MOVIL = 5;
 float bufferMediaVoltaje[TAM_MEDIA_MOVIL] = {0.0};
 float sumaMediaVoltaje = 0.0;
 uint8_t idxMediaVoltaje = 0;
@@ -203,8 +202,12 @@ void calcularTorque() {
 }
 
 void aplicarTopeVirtual() {
-  float torque_centrado_virtual = autocentradoActivado ? -RIGIDEZ_CENTRADO_VEL * velocidad_simulada * grados_volante : 0.0;
+  // Torque de recentrado cuadrático (progresivo según ángulo)
+  float torque_centrado_virtual = autocentradoActivado
+    ? -0.001 * grados_volante * abs(grados_volante)
+    : 0.0;
 
+  // Torque virtual en los extremos del recorrido (topes virtuales)
   if (grados_volante > VOLANTE_RANGO_GRADOS / 2 - TORQUE_ZONE_DEG)
     par_virtual = -TORQUE_LIMIT_VIRTUAL;
   else if (grados_volante < -VOLANTE_RANGO_GRADOS / 2 + TORQUE_ZONE_DEG)
@@ -212,23 +215,31 @@ void aplicarTopeVirtual() {
   else
     par_virtual = torque_centrado_virtual;
 
+  // Aplicación del torque al Dynamixel si está activado
   if (torqueActivado) {
     dxl.torqueOn(DXL_ID);
+
+    // Torque total que se aplica al volante
     float torque_total = torque_final_volante_suave + par_virtual;
+
+    // Conversión a corriente en mA según curva del Dynamixel
     int16_t corriente_dxl_mA = (torque_total / TORQUE_MAX_VOLANTE) * 1193;
     corriente_dxl_mA = constrain(corriente_dxl_mA, -1193, 1193);
+
+    // Aplicación al motor
     dxl.setGoalCurrent(DXL_ID, corriente_dxl_mA, UNIT_MILLI_AMPERE);
   } else {
     dxl.torqueOff(DXL_ID);
   }
 }
 
+
 void enviarCAN() {
   CAN_frame_t tx_frame;
   tx_frame.FIR.B.FF = CAN_frame_std;
   tx_frame.MsgID = 0x298;
   tx_frame.FIR.B.DLC = 8;
-  tx_frame.data.u8[0] = pulsadorValor;
+  tx_frame.data.u8[0] = 5;
   tx_frame.data.u8[1] = direccion_bits;
   tx_frame.data.u8[2] = bit_centrado;
   tx_frame.data.u8[3] = (uint8_t)velocidad_simulada;

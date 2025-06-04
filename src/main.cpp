@@ -7,712 +7,450 @@
 #include <SD.h>
 #include <Dynamixel2Arduino.h>
 
-// ============================================================================
-// DEFINICIONES Y CONSTANTES
-// ============================================================================
-
+// ========== CONFIGURACIÓN DE HARDWARE ==========
 // Pines
-#define VOLTAJE_HALL     35
-#define VOLTAJE_BATERIA  34
-#define ENCODER_CLK      32
-#define ENCODER_DT       33
-#define ENCODER_SW       25
-#define RS485_TX_PIN     22
-#define RS485_RX_PIN     21
-#define RS485_EN_PIN     17
-#define RS485_SE_PIN     19
-#define PIN_5V_EN        16
+#define VOLTAJE_HALL         35
+#define VOLTAJE_BATERIA      34
+#define ENCODER_CLK         32
+#define ENCODER_DT          33
+#define ENCODER_SW          25
+
+#define RS485_TX_PIN        22
+#define RS485_RX_PIN        21
+#define RS485_EN_PIN        17
+#define RS485_SE_PIN        19
+#define PIN_5V_EN           16
 
 // Configuración Dynamixel
-#define DXL_PROTOCOL_VERSION 2.0
-#define DXL_BAUDRATE         57600
-#define DXL_ID               1
-
-// Constantes del sistema
-namespace Config {
-    const unsigned long CALIBRATION_TIME_MS = 10000;
-    const unsigned long MAIN_LOOP_INTERVAL_MS = 3;
-    const unsigned long SMOOTH_INTERVAL_MS = 20;
-    const unsigned long CAN_TIMEOUT_MS = 100;
-    const unsigned long DXL_TIMEOUT_MS = 50;
-    
-    const float STEERING_RANGE_DEG = 900.0f;
-    const float MAX_WHEEL_TORQUE = 8.0f;
-    const float MAX_RACK_TORQUE = 40.0f;
-    const float VIRTUAL_TORQUE_LIMIT = 5.0f;
-    const float TORQUE_ZONE_DEG = 10.0f;
-    const float CENTERING_STIFFNESS = 0.05f;
-    const float CENTERING_DEADZONE = 3.0f;
-    const float DAMPING_COEFFICIENT = 0.02f;
-    
-    const float CURRENT_SENSITIVITY = 0.0160f;
-    const float TORQUE_CURRENT_RATIO = 1.2f;
-    const int SPEED_MIN = 0;
-    const int SPEED_MAX = 255;
-    const int SPEED_STEP = 5;
-    
-    const uint8_t MEDIAN_KERNEL_SIZE = 3;
-    const uint8_t MOVING_AVG_SIZE = 5;
-    const float IIR_ALPHA = 0.5f;
-    const float SMOOTH_ALPHA = 0.1f;
-}
-
-// ============================================================================
-// ENUMERACIONES Y ESTRUCTURAS
-// ============================================================================
-
-enum SystemState {
-    INITIALIZING,
-    CALIBRATING,
-    NORMAL_OPERATION,
-    ERROR_STATE,
-    SAFE_MODE
-};
-
-struct SensorData {
-    float voltage;
-    float current;
-    float position_deg;
-    float angular_velocity;
-    uint32_t timestamp;
-    bool valid;
-    
-    SensorData() : voltage(0), current(0), position_deg(0), 
-                   angular_velocity(0), timestamp(0), valid(false) {}
-};
-
-struct CANData {
-    uint8_t duty;
-    uint8_t current;
-    float voltage;
-    uint8_t switch_pos;
-    uint8_t temperature;
-    uint8_t angle_dir;
-    uint8_t map_value;
-    uint8_t error_code;
-    uint32_t last_update;
-    bool valid;
-    
-    CANData() : duty(0), current(0), voltage(0), switch_pos(0), 
-                temperature(0), angle_dir(0), map_value(0), error_code(0),
-                last_update(0), valid(false) {}
-};
-
-struct ControlState {
-    float feedback_torque;
-    float centering_torque;
-    float virtual_torque;
-    float total_torque;
-    int16_t dynamixel_current_ma;
-    bool torque_enabled;
-    bool autocentering_enabled;
-    
-    ControlState() : feedback_torque(0), centering_torque(0), virtual_torque(0),
-                     total_torque(0), dynamixel_current_ma(0), 
-                     torque_enabled(true), autocentering_enabled(false) {}
-};
-
-// ============================================================================
-// CLASES DE FILTRADO
-// ============================================================================
-
-class MedianFilter {
-private:
-    float* buffer;
-    uint8_t size;
-    uint8_t index;
-    
-public:
-    MedianFilter(uint8_t sz) : size(sz), index(0) {
-        buffer = new float[size]();
-    }
-    
-    ~MedianFilter() { delete[] buffer; }
-    
-    float update(float value) {
-        buffer[index] = value;
-        index = (index + 1) % size;
-        
-        // Crear copia temporal y ordenar
-        float temp[size];
-        memcpy(temp, buffer, size * sizeof(float));
-        
-        // Bubble sort simple para arrays pequeños
-        for (uint8_t i = 0; i < size - 1; i++) {
-            for (uint8_t j = i + 1; j < size; j++) {
-                if (temp[j] < temp[i]) {
-                    float t = temp[i];
-                    temp[i] = temp[j];
-                    temp[j] = t;
-                }
-            }
-        }
-        return temp[size / 2];
-    }
-};
-
-class MovingAverageFilter {
-private:
-    float* buffer;
-    float sum;
-    uint8_t size;
-    uint8_t index;
-    bool filled;
-    
-public:
-    MovingAverageFilter(uint8_t sz) : size(sz), index(0), sum(0), filled(false) {
-        buffer = new float[size]();
-    }
-    
-    ~MovingAverageFilter() { delete[] buffer; }
-    
-    float update(float value) {
-        sum -= buffer[index];
-        buffer[index] = value;
-        sum += value;
-        index = (index + 1) % size;
-        
-        if (index == 0) filled = true;
-        
-        return sum / (filled ? size : (index == 0 ? size : index));
-    }
-};
-
-class IIRFilter {
-private:
-    float value;
-    float alpha;
-    bool initialized;
-    
-public:
-    IIRFilter(float a) : alpha(a), value(0), initialized(false) {}
-    
-    float update(float input) {
-        if (!initialized) {
-            value = input;
-            initialized = true;
-        } else {
-            value = alpha * input + (1.0f - alpha) * value;
-        }
-        return value;
-    }
-    
-    float getValue() const { return value; }
-};
-
-// ============================================================================
-// VARIABLES GLOBALES
-// ============================================================================
-
-// Hardware
 HardwareSerial DXL_SERIAL(2);
 Dynamixel2Arduino dxl(DXL_SERIAL, RS485_EN_PIN);
-CAN_device_t CAN_cfg;
+const float DXL_PROTOCOL_VERSION = 2.0;
+const uint32_t DXL_BAUDRATE = 57600;
+const uint8_t DXL_ID = 1;
 
+// ========== PARÁMETROS DEL SISTEMA ==========
+const float VOLANTE_RANGO_GRADOS = 900.0f;
+const float TORQUE_MAX_VOLANTE = 8.0f;
+const float TORQUE_MAX_CREMALLERA = 40.0f;
+const float TORQUE_LIMIT_VIRTUAL = 5.0f;
+const float TORQUE_ZONE_DEG = 10.0f;
+const float RIGIDEZ_CENTRADO_VEL = 0.05f;
+
+// Configuración velocidad simulada
+int velocidad_simulada = 0;
+const int VEL_MIN = 0;
+const int VEL_MAX = 255;
+const int VEL_STEP = 5;
+
+// Filtrado de señales
+const float ALPHA_SUAVE = 0.05f;
+const float ALPHA_VOLTAJE_IIR = 0.5f;
+const uint8_t KERNEL_MEDIANA = 3;
+const uint8_t TAM_MEDIA_MOVIL = 5;
+
+// ========== VARIABLES GLOBALES ==========
 // Estado del sistema
-SystemState system_state = INITIALIZING;
-SensorData sensor_data;
-CANData can_data;
-ControlState control_state;
+struct SystemState {
+    bool calibrado = false;
+    bool torqueActivado = true;
+    bool autocentradoActivado = false;
+    int signoTorque = 0;
+    int32_t pos_offset_dyna = 0;
+};
+
+// Mediciones
+struct Measurements {
+    float voltaje_suave = 0.0f;
+    float torque_final_suave = 0.0f;
+    float torque_final_volante_suave = 0.0f;
+    float voltaje_final = 0.0f;
+    float corriente_final = 0.0f;
+    float torque_final = 0.0f;
+    float torque_final_volante = 0.0f;
+    float grados_volante = 0.0f;
+    float par_virtual = 0.0f;
+    float VREF = 0.0f;
+};
+
+// Comunicación CAN
+struct CANData {
+    uint8_t last_duty = 0;
+    uint8_t last_corriente = 0;
+    float last_voltaje_CAN = 0.0f;
+    uint8_t last_switch = 0;
+    uint8_t last_temp = 0;
+    uint8_t last_angle_dir = 0;
+    uint8_t last_mapa = 0;
+    uint8_t last_error = 0;
+};
+
+// Encoder
+struct EncoderState {
+    int lastCLK = HIGH;
+    int pulsadorState = HIGH;
+    int lastPulsadorState = HIGH;
+    int pulsadorValor = 0;
+};
+
+// Buffers para filtrado
+struct FilterBuffers {
+    float bufferMedianaVoltaje[KERNEL_MEDIANA] = {0.0f};
+    float bufferMediaVoltaje[TAM_MEDIA_MOVIL] = {0.0f};
+    float voltajeIIR = 0.0f;
+    float sumaMediaVoltaje = 0.0f;
+    uint8_t idxMedianaVoltaje = 0;
+    uint8_t idxMediaVoltaje = 0;
+};
+
+// ========== INSTANCIAS ==========
+SystemState systemState;
+Measurements measurements;
+CANData canData;
+EncoderState encoderState;
+FilterBuffers filterBuffers;
+
+// Configuración CAN
+CAN_device_t CAN_cfg;
+const int rx_queue_size = 10;
+const int interval = 3;
+unsigned long previousMedicion = 0;
+unsigned long previousSuavizado = 0;
+const unsigned long intervaloSuavizado = 50;
 
 // Calibración
-float vref = 0.0f;
-float vref_sum = 0.0f;
-unsigned long vref_samples = 0;
-unsigned long calibration_start = 0;
+const float SENSIBILIDAD = 0.0160f;
+const uint32_t TIEMPO_CALIBRACION_MS = 10000;
+unsigned long tiempoInicio = 0;
+float sumaVref = 0.0f;
+unsigned long muestrasVref = 0;
 
-// Filtros
-MedianFilter* median_filter = nullptr;
-MovingAverageFilter* movavg_filter = nullptr;
-IIRFilter* iir_filter = nullptr;
-IIRFilter* smooth_torque_filter = nullptr;
+// ========== PROTOTIPOS DE FUNCIONES ==========
+void setupHardware();
+void calibrateSystem();
+void leerCAN();
+void leerPulsador();
+void leerSensorCorriente();
+void calcularDireccion();
+void calcularTorque();
+void aplicarTopeVirtual();
+void enviarCAN();
+void imprimirDebug();
+void serialControlModoTorque();
+float calcularTorqueVolante(float corriente);
+float medianaN(float* arr, uint8_t size);
+void checkDynamixelConnection();
 
-// Control de posición
-int32_t position_offset = 0;
-float previous_position = 0.0f;
-unsigned long previous_position_time = 0;
-
-// Encoder y UI
-int simulated_speed = 0;
-int encoder_clk_last = HIGH;
-int button_state = HIGH;
-int button_state_last = HIGH;
-int button_value = 0;
-
-// Timing
-unsigned long last_main_loop = 0;
-unsigned long last_smooth_update = 0;
-unsigned long last_can_rx = 0;
-unsigned long last_dxl_comm = 0;
-
-// Debug y logging
-bool debug_enabled = true;
-unsigned long debug_counter = 0;
-
-// ============================================================================
-// FUNCIONES DE UTILIDAD
-// ============================================================================
-
-float constrainf(float value, float min_val, float max_val) {
-    if (value < min_val) return min_val;
-    if (value > max_val) return max_val;
-    return value;
+// ========== FUNCIONES PRINCIPALES ==========
+void setup() {
+    setupHardware();
+    calibrateSystem();
 }
 
-bool isTimeout(unsigned long last_time, unsigned long timeout_ms) {
-    return (millis() - last_time) > timeout_ms;
-}
+void loop() {
+    unsigned long currentMillis = millis();
 
-float mapf(float value, float in_min, float in_max, float out_min, float out_max) {
-    return (value - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
-}
+    if (!systemState.calibrado) return;
 
-// ============================================================================
-// FUNCIONES DE VALIDACIÓN Y SEGURIDAD
-// ============================================================================
-
-bool validateSensorData() {
-    return (sensor_data.voltage > 0.1f && sensor_data.voltage < 3.2f) &&
-           (abs(sensor_data.current) < 50.0f) &&
-           (abs(sensor_data.position_deg) <= Config::STEERING_RANGE_DEG / 2.0f);
-}
-
-bool validateCANData() {
-    return can_data.valid && !isTimeout(can_data.last_update, Config::CAN_TIMEOUT_MS);
-}
-
-void enterSafeMode(const char* reason) {
-    system_state = SAFE_MODE;
-    control_state.torque_enabled = false;
-    dxl.torqueOff(DXL_ID);
-    
-    if (debug_enabled) {
-        Serial.print("⚠️ MODO SEGURO: ");
-        Serial.println(reason);
-    }
-}
-
-void checkSystemHealth() {
-    // Verificar timeouts de comunicación
-    if (isTimeout(last_can_rx, Config::CAN_TIMEOUT_MS * 3)) {
-        enterSafeMode("Timeout CAN");
-        return;
-    }
-    
-    if (isTimeout(last_dxl_comm, Config::DXL_TIMEOUT_MS * 3)) {
-        enterSafeMode("Timeout Dynamixel");
-        return;
-    }
-    
-    // Verificar datos de sensores
-    if (!validateSensorData()) {
-        enterSafeMode("Datos de sensor inválidos");
-        return;
-    }
-    
-    // Si estamos en modo seguro, intentar recuperación
-    if (system_state == SAFE_MODE) {
-        if (validateSensorData() && validateCANData()) {
-            system_state = NORMAL_OPERATION;
-            if (debug_enabled) {
-                Serial.println("✅ Sistema recuperado del modo seguro");
-            }
-        }
-    }
-}
-
-// ============================================================================
-// FUNCIONES DE LECTURA DE SENSORES
-// ============================================================================
-
-void readCurrentSensor() {
-    int adc_reading = analogRead(VOLTAJE_HALL);
-    float voltage = (adc_reading / 4095.0f) * 3.3f;
-    
-    // Aplicar filtros en cascada
-    float median_voltage = median_filter->update(voltage);
-    float avg_voltage = movavg_filter->update(median_voltage);
-    float filtered_voltage = iir_filter->update(avg_voltage);
-    
-    sensor_data.voltage = filtered_voltage;
-    sensor_data.current = (filtered_voltage - vref) / Config::CURRENT_SENSITIVITY;
-    sensor_data.timestamp = millis();
-    sensor_data.valid = true;
-}
-
-void readPositionSensor() {
-    int32_t current_pos = dxl.getPresentPosition(DXL_ID);
-    if (current_pos == -1) return; // Error de lectura
-    
-    last_dxl_comm = millis();
-    
-    int32_t delta_pos = current_pos - position_offset;
-    float new_position = (delta_pos / 4096.0f) * 360.0f;
-    new_position = constrainf(new_position, -Config::STEERING_RANGE_DEG / 2.0f, 
-                                           Config::STEERING_RANGE_DEG / 2.0f);
-    
-    // Calcular velocidad angular
-    unsigned long current_time = millis();
-    if (previous_position_time > 0) {
-        float dt = (current_time - previous_position_time) / 1000.0f;
-        if (dt > 0) {
-            sensor_data.angular_velocity = (new_position - previous_position) / dt;
-        }
-    }
-    
-    sensor_data.position_deg = new_position;
-    previous_position = new_position;
-    previous_position_time = current_time;
-}
-
-void readEncoder() {
-    int current_clk = digitalRead(ENCODER_CLK);
-    if (current_clk != encoder_clk_last && current_clk == LOW) {
-        if (digitalRead(ENCODER_DT) != current_clk) {
-            simulated_speed += Config::SPEED_STEP;
-        } else {
-            simulated_speed -= Config::SPEED_STEP;
-        }
-        simulated_speed = constrain(simulated_speed, Config::SPEED_MIN, Config::SPEED_MAX);
-    }
-    encoder_clk_last = current_clk;
-    
-    // Leer botón
-    button_state = digitalRead(ENCODER_SW);
-    if (button_state == LOW && button_state_last == HIGH) {
-        button_value = (button_value + 1) % 6;
-    }
-    button_state_last = button_state;
-}
-
-void readCANData() {
-    CAN_frame_t rx_frame;
-    while (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 0) == pdTRUE) {
-        last_can_rx = millis();
+    if (currentMillis - previousMedicion >= interval) {
+        previousMedicion = currentMillis;
         
-        if (rx_frame.MsgID == 0x290) {
-            can_data.duty = rx_frame.data.u8[1];
-            can_data.current = rx_frame.data.u8[2];
-            can_data.voltage = rx_frame.data.u8[3] * 0.1f;
-            can_data.switch_pos = rx_frame.data.u8[4];
-            can_data.temperature = rx_frame.data.u8[5];
-            can_data.last_update = millis();
-            can_data.valid = true;
-        } else if (rx_frame.MsgID == 0x292) {
-            can_data.angle_dir = rx_frame.data.u8[0];
-            can_data.map_value = rx_frame.data.u8[3];
-            can_data.error_code = rx_frame.data.u8[4];
-        }
+        leerCAN();
+        leerPulsador();
+        leerSensorCorriente();
+        calcularDireccion();
+        calcularTorque();
+        aplicarTopeVirtual();
+        enviarCAN();
+        imprimirDebug();
     }
+
+    serialControlModoTorque();
 }
 
-// ============================================================================
-// FUNCIONES DE CONTROL
-// ============================================================================
-
-float calculateFeedbackTorque() {
-    // Torque basado en la corriente de la cremallera (resistencia del camino)
-    float road_torque = -Config::TORQUE_CURRENT_RATIO * sensor_data.current;
-    
-    // Escalar al rango del volante
-    return constrainf(road_torque * (Config::MAX_WHEEL_TORQUE / Config::MAX_RACK_TORQUE),
-                     -Config::MAX_WHEEL_TORQUE, Config::MAX_WHEEL_TORQUE);
-}
-
-float calculateCenteringTorque() {
-    if (!control_state.autocentering_enabled) return 0.0f;
-    
-    float abs_position = abs(sensor_data.position_deg);
-    if (abs_position <= Config::CENTERING_DEADZONE) return 0.0f;
-    
-    // Torque de centrado proporcional a la posición
-    float centering = -Config::CENTERING_STIFFNESS * sensor_data.position_deg;
-    
-    // Amortiguación proporcional a la velocidad
-    float damping = -Config::DAMPING_COEFFICIENT * sensor_data.angular_velocity;
-    
-    return centering + damping;
-}
-
-float calculateVirtualStops() {
-    float half_range = Config::STEERING_RANGE_DEG / 2.0f;
-    
-    if (sensor_data.position_deg > half_range - Config::TORQUE_ZONE_DEG) {
-        // Tope derecho
-        float penetration = sensor_data.position_deg - (half_range - Config::TORQUE_ZONE_DEG);
-        return -Config::VIRTUAL_TORQUE_LIMIT * (penetration / Config::TORQUE_ZONE_DEG);
-    } else if (sensor_data.position_deg < -half_range + Config::TORQUE_ZONE_DEG) {
-        // Tope izquierdo
-        float penetration = abs(sensor_data.position_deg) - (half_range - Config::TORQUE_ZONE_DEG);
-        return Config::VIRTUAL_TORQUE_LIMIT * (penetration / Config::TORQUE_ZONE_DEG);
-    }
-    
-    return 0.0f;
-}
-
-void updateControlSystem() {
-    if (system_state != NORMAL_OPERATION) return;
-    
-    // Calcular componentes de torque
-    control_state.feedback_torque = calculateFeedbackTorque();
-    control_state.centering_torque = calculateCenteringTorque();
-    control_state.virtual_torque = calculateVirtualStops();
-    
-    // Sumar todos los componentes
-    control_state.total_torque = control_state.feedback_torque + 
-                                control_state.centering_torque + 
-                                control_state.virtual_torque;
-    
-    // Aplicar suavizado
-    if (millis() - last_smooth_update >= Config::SMOOTH_INTERVAL_MS) {
-        control_state.total_torque = smooth_torque_filter->update(control_state.total_torque);
-        last_smooth_update = millis();
-    }
-    
-    // Convertir a corriente del Dynamixel
-    control_state.dynamixel_current_ma = 
-        (control_state.total_torque / Config::MAX_WHEEL_TORQUE) * 1193;
-    control_state.dynamixel_current_ma = 
-        constrain(control_state.dynamixel_current_ma, -1193, 1193);
-}
-
-void applyTorqueControl() {
-    if (!control_state.torque_enabled || system_state != NORMAL_OPERATION) {
-        dxl.torqueOff(DXL_ID);
-        return;
-    }
-    
-    dxl.torqueOn(DXL_ID);
-    dxl.setGoalCurrent(DXL_ID, control_state.dynamixel_current_ma, UNIT_MILLI_AMPERE);
-    last_dxl_comm = millis();
-}
-
-// ============================================================================
-// FUNCIONES DE COMUNICACIÓN
-// ============================================================================
-
-void sendCANData() {
-    CAN_frame_t tx_frame;
-    tx_frame.FIR.B.FF = CAN_frame_std;
-    tx_frame.MsgID = 0x298;
-    tx_frame.FIR.B.DLC = 8;
-    
-    // Convertir posición a bits de dirección
-    float direction_bits_f = mapf(sensor_data.position_deg + Config::STEERING_RANGE_DEG / 2.0f,
-                                 0, Config::STEERING_RANGE_DEG, 10.0f, 250.0f);
-    uint8_t direction_bits = static_cast<uint8_t>(constrainf(direction_bits_f, 10.0f, 250.0f));
-    
-    uint8_t centered_bit = (abs(sensor_data.position_deg) < 5.0f) ? 1 : 0;
-    
-    tx_frame.data.u8[0] = 5;
-    tx_frame.data.u8[1] = direction_bits;
-    tx_frame.data.u8[2] = centered_bit;
-    tx_frame.data.u8[3] = static_cast<uint8_t>(simulated_speed);
-    tx_frame.data.u8[4] = 0x00;
-    tx_frame.data.u8[5] = 0x00;
-    tx_frame.data.u8[6] = 0x00;
-    tx_frame.data.u8[7] = 0x00;
-    
-    ESP32Can.CANWriteFrame(&tx_frame);
-}
-
-void processSerialCommands() {
-    while (Serial.available()) {
-        char c = Serial.read();
-        switch (c) {
-            case '1':
-                control_state.torque_enabled = !control_state.torque_enabled;
-                Serial.print("🔧 Torque ");
-                Serial.println(control_state.torque_enabled ? "ACTIVADO" : "DESACTIVADO");
-                break;
-                
-            case '2':
-                control_state.autocentering_enabled = !control_state.autocentering_enabled;
-                Serial.print("📐 Autocentrado ");
-                Serial.println(control_state.autocentering_enabled ? "ACTIVADO" : "DESACTIVADO");
-                break;
-                
-            case 'd':
-                debug_enabled = !debug_enabled;
-                Serial.print("🐛 Debug ");
-                Serial.println(debug_enabled ? "ACTIVADO" : "DESACTIVADO");
-                break;
-                
-            case 'r':
-                if (system_state == SAFE_MODE) {
-                    system_state = NORMAL_OPERATION;
-                    Serial.println("🔄 Sistema reiniciado");
-                }
-                break;
-        }
-    }
-}
-
-void printDebugInfo() {
-    if (!debug_enabled || (debug_counter++ % 100 != 0)) return;
-    
-    Serial.print(sensor_data.voltage, 4); Serial.print(",");
-    Serial.print(can_data.duty); Serial.print(",");
-    Serial.print(can_data.current); Serial.print(",");
-    Serial.print(can_data.voltage, 1); Serial.print(",");
-    Serial.print(can_data.switch_pos); Serial.print(",");
-    Serial.print(can_data.temperature); Serial.print(",");
-    Serial.print(can_data.angle_dir); Serial.print(",");
-    Serial.print(can_data.map_value); Serial.print(",");
-    Serial.print(can_data.error_code); Serial.print(",");
-    Serial.print(sensor_data.position_deg, 2); Serial.print(",");
-    Serial.print(button_value); Serial.print(",");
-    Serial.print(sensor_data.current, 4); Serial.print(",");
-    Serial.print(control_state.feedback_torque, 4); Serial.print(",");
-    Serial.print(control_state.centering_torque, 4); Serial.print(",");
-    Serial.print(control_state.virtual_torque, 4); Serial.print(",");
-    Serial.print(control_state.total_torque, 4); Serial.print(",");
-    Serial.print(control_state.dynamixel_current_ma); Serial.print(",");
-    Serial.println(static_cast<int>(system_state));
-}
-
-// ============================================================================
-// FUNCIONES DE CALIBRACIÓN E INICIALIZACIÓN
-// ============================================================================
-
-void performCalibration() {
-    int adc_reading = analogRead(VOLTAJE_HALL);
-    float voltage = (adc_reading / 4095.0f) * 3.3f;
-    vref_sum += voltage;
-    vref_samples++;
-    
-    if (millis() - calibration_start >= Config::CALIBRATION_TIME_MS) {
-        vref = vref_sum / vref_samples;
-        system_state = NORMAL_OPERATION;
-        
-        Serial.print("✅ Calibración completada. VREF = ");
-        Serial.print(vref, 4);
-        Serial.println(" V");
-        
-        if (debug_enabled) {
-            Serial.println("V_hall,MotorDuty,I_CAN,V_CAN,Switch,Temp,DirAngle,Mapa,Error,Pos_deg,Button,I_final,T_feedback,T_centering,T_virtual,T_total,I_dxl_mA,State");
-        }
-    }
-}
-
-bool initializeHardware() {
-    // Configurar pines
+// ========== IMPLEMENTACIÓN DE FUNCIONES ==========
+void setupHardware() {
+    // Configuración de pines
     pinMode(PIN_5V_EN, OUTPUT);
     digitalWrite(PIN_5V_EN, HIGH);
     pinMode(RS485_EN_PIN, OUTPUT);
     digitalWrite(RS485_EN_PIN, LOW);
     pinMode(RS485_SE_PIN, OUTPUT);
     digitalWrite(RS485_SE_PIN, HIGH);
-    pinMode(CAN_SE_PIN, OUTPUT);
-    digitalWrite(CAN_SE_PIN, LOW);
-    pinMode(ENCODER_CLK, INPUT);
-    pinMode(ENCODER_DT, INPUT);
-    pinMode(ENCODER_SW, INPUT_PULLUP);
-    
     delay(100);
-    
-    // Inicializar Serial
+
+    // Inicialización comunicación serie
     Serial.begin(921600);
-    analogReadResolution(12);
-    
-    // Inicializar Dynamixel
+    while (!Serial); // Esperar a que se inicie el puerto serial
+
+    // Configuración Dynamixel
     DXL_SERIAL.begin(DXL_BAUDRATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
     dxl.begin();
     dxl.setPortProtocolVersion(DXL_PROTOCOL_VERSION);
-    
-    if (dxl.ping(DXL_ID)) {
-        Serial.println("✅ Dynamixel detectado.");
-        dxl.torqueOff(DXL_ID);
-        position_offset = dxl.getPresentPosition(DXL_ID);
-        Serial.print("📍 Offset posición inicial: ");
-        Serial.println(position_offset);
-    } else {
-        Serial.println("❌ Dynamixel no responde.");
-        return false;
-    }
-    
-    // Inicializar CAN
+    checkDynamixelConnection();
+
+    // Configuración ADC
+    analogReadResolution(12);
+
+    // Configuración pines encoder
+    pinMode(ENCODER_CLK, INPUT);
+    pinMode(ENCODER_DT, INPUT);
+    pinMode(ENCODER_SW, INPUT_PULLUP);
+    encoderState.lastCLK = digitalRead(ENCODER_CLK);
+
+    // Configuración CAN
+    pinMode(CAN_SE_PIN, OUTPUT);
+    digitalWrite(CAN_SE_PIN, LOW);
     CAN_cfg.speed = CAN_SPEED_250KBPS;
     CAN_cfg.tx_pin_id = GPIO_NUM_27;
     CAN_cfg.rx_pin_id = GPIO_NUM_26;
-    CAN_cfg.rx_queue = xQueueCreate(10, sizeof(CAN_frame_t));
-    ESP32Can.CANInit();
-    
-    // Inicializar filtros
-    median_filter = new MedianFilter(Config::MEDIAN_KERNEL_SIZE);
-    movavg_filter = new MovingAverageFilter(Config::MOVING_AVG_SIZE);
-    iir_filter = new IIRFilter(Config::IIR_ALPHA);
-    smooth_torque_filter = new IIRFilter(Config::SMOOTH_ALPHA);
-    
-    encoder_clk_last = digitalRead(ENCODER_CLK);
-    
-    return true;
+    CAN_cfg.rx_queue = xQueueCreate(rx_queue_size, sizeof(CAN_frame_t));
+    if (ESP32Can.CANInit() != ESP_OK) {
+        Serial.println("Error al inicializar CAN");
+    }
 }
 
-// ============================================================================
-// FUNCIONES PRINCIPALES
-// ============================================================================
-
-void setup() {
-    system_state = INITIALIZING;
-    
-    if (!initializeHardware()) {
-        system_state = ERROR_STATE;
+void checkDynamixelConnection() {
+    if (dxl.ping(DXL_ID)) {
+        Serial.println("✅ Dynamixel detectado.");
+        dxl.torqueOff(DXL_ID);
+    } else {
+        Serial.println("❌ Dynamixel no responde.");
         while (true) {
-            Serial.println("❌ Error de inicialización. Sistema detenido.");
-            delay(5000);
+            delay(1000);
+            Serial.println("Reintentando conexión con Dynamixel...");
+            if (dxl.ping(DXL_ID)) {
+                Serial.println("✅ Dynamixel conectado después de reintento.");
+                break;
+            }
         }
     }
-    
-    // Iniciar calibración
-    system_state = CALIBRATING;
-    calibration_start = millis();
-    Serial.println("⚙️ Calibrando VREF durante 10 segundos, mantén el motor en idle...");
 }
 
-void loop() {
-    unsigned long current_time = millis();
+void calibrateSystem() {
+    Serial.println("⚙️ Calibrando VREF durante 10 segundos, mantén el motor en idle...");
+    tiempoInicio = millis();
     
-    // Procesamiento según el estado del sistema
-    switch (system_state) {
-        case CALIBRATING:
-            performCalibration();
-            return;
-            
-        case ERROR_STATE:
-        case SAFE_MODE:
-            processSerialCommands();
-            delay(100);
-            return;
-            
-        default:
-            break;
+    while (millis() - tiempoInicio < TIEMPO_CALIBRACION_MS) {
+        int lecturaADC = analogRead(VOLTAJE_HALL);
+        float voltaje = (lecturaADC / 4095.0f) * 3.3f;
+        sumaVref += voltaje;
+        muestrasVref++;
+        delay(10);
     }
     
-    // Loop principal - ejecutar a intervalos regulares
-    if (current_time - last_main_loop >= Config::MAIN_LOOP_INTERVAL_MS) {
-        last_main_loop = current_time;
-        
-        // Leer sensores y entradas
-        readCANData();
-        readEncoder();
-        readCurrentSensor();
-        readPositionSensor();
-        
-        // Verificar salud del sistema
-        checkSystemHealth();
-        
-        if (system_state == NORMAL_OPERATION) {
-            // Actualizar sistema de control
-            updateControlSystem();
-            applyTorqueControl();
-            sendCANData();
+    measurements.VREF = sumaVref / muestrasVref;
+    systemState.calibrado = true;
+    Serial.print("✅ Calibración completada. VREF = ");
+    Serial.print(measurements.VREF, 4);
+    Serial.println(" V");
+    Serial.println("V_hall(V),MotorDuty(%),I_CAN(A),V_CAN(V),SwitchPos,Temp(°C),DirAngle(bits),Mapa,Error,DireccionBits,Pulsador,V_final(V),I_final(A),Torque_final(N·m),Torque_volante(N·m),Voltaje_suave(V),Torque_final_suave(N·m),Torque_volante_suave(N·m),I_Dynamixel(mA)");
+}
+
+float calcularTorqueVolante(float corriente) {
+    float torque = 1.2f * corriente;
+    return constrain(torque * (TORQUE_MAX_VOLANTE / TORQUE_MAX_CREMALLERA), -TORQUE_MAX_VOLANTE, TORQUE_MAX_VOLANTE);
+}
+
+float medianaN(float* arr, uint8_t size) {
+    float temp[size];
+    memcpy(temp, arr, size * sizeof(float));
+    
+    for (uint8_t i = 0; i < size - 1; i++) {
+        for (uint8_t j = i + 1; j < size; j++) {
+            if (temp[j] < temp[i]) {
+                float t = temp[i];
+                temp[i] = temp[j];
+                temp[j] = t;
+            }
         }
-        
-        // Debug y comunicación serie
-        printDebugInfo();
     }
+    return temp[size / 2];
+}
+
+void leerCAN() {
+    CAN_frame_t rx_frame;
+    while (xQueueReceive(CAN_cfg.rx_queue, &rx_frame, 0) == pdTRUE) {
+        if (rx_frame.MsgID == 0x290) {
+            canData.last_duty = rx_frame.data.u8[1];
+            canData.last_corriente = rx_frame.data.u8[2];
+            canData.last_voltaje_CAN = rx_frame.data.u8[3] * 0.1f;
+            canData.last_switch = rx_frame.data.u8[4];
+            canData.last_temp = rx_frame.data.u8[5];
+        } else if (rx_frame.MsgID == 0x292) {
+            canData.last_angle_dir = rx_frame.data.u8[0];
+            canData.last_mapa = rx_frame.data.u8[3];
+            canData.last_error = rx_frame.data.u8[4];
+        }
+    }
+}
+
+void leerPulsador() {
+    int currentCLK = digitalRead(ENCODER_CLK);
+    if (currentCLK != encoderState.lastCLK && currentCLK == LOW) {
+        if (digitalRead(ENCODER_DT) != currentCLK) {
+            velocidad_simulada += VEL_STEP;
+        } else {
+            velocidad_simulada -= VEL_STEP;
+        }
+        velocidad_simulada = constrain(velocidad_simulada, VEL_MIN, VEL_MAX);
+    }
+    encoderState.lastCLK = currentCLK;
+
+    encoderState.pulsadorState = digitalRead(ENCODER_SW);
+    if (encoderState.pulsadorState == LOW && encoderState.lastPulsadorState == HIGH) {
+        encoderState.pulsadorValor = (encoderState.pulsadorValor + 1) % 6;
+    }
+    encoderState.lastPulsadorState = encoderState.pulsadorState;
+}
+
+void leerSensorCorriente() {
+    int lecturaADC = analogRead(VOLTAJE_HALL);
+    float voltaje = (lecturaADC / 4095.0f) * 3.3f;
+
+    // Filtrado de mediana
+    filterBuffers.bufferMedianaVoltaje[filterBuffers.idxMedianaVoltaje] = voltaje;
+    filterBuffers.idxMedianaVoltaje = (filterBuffers.idxMedianaVoltaje + 1) % KERNEL_MEDIANA;
+    float voltajeMediana = medianaN(filterBuffers.bufferMedianaVoltaje, KERNEL_MEDIANA);
+
+    // Filtrado de media móvil
+    filterBuffers.sumaMediaVoltaje -= filterBuffers.bufferMediaVoltaje[filterBuffers.idxMediaVoltaje];
+    filterBuffers.bufferMediaVoltaje[filterBuffers.idxMediaVoltaje] = voltajeMediana;
+    filterBuffers.sumaMediaVoltaje += voltajeMediana;
+    filterBuffers.idxMediaVoltaje = (filterBuffers.idxMediaVoltaje + 1) % TAM_MEDIA_MOVIL;
+
+    float voltajeMediaMovil = filterBuffers.sumaMediaVoltaje / TAM_MEDIA_MOVIL;
+    filterBuffers.voltajeIIR = ALPHA_VOLTAJE_IIR * voltajeMediaMovil + (1.0f - ALPHA_VOLTAJE_IIR) * filterBuffers.voltajeIIR;
+    measurements.voltaje_final = filterBuffers.voltajeIIR;
+
+    measurements.corriente_final = (measurements.voltaje_final - measurements.VREF) / SENSIBILIDAD;
+}
+
+void calcularDireccion() {
+    static float grados_volante_anterior = 0.0f;
+    int32_t pos_actual = dxl.getPresentPosition(DXL_ID);
+    int32_t delta_pos = pos_actual - systemState.pos_offset_dyna;
+
+    measurements.grados_volante = (delta_pos / 4096.0f) * 360.0f;
+    measurements.grados_volante = constrain(measurements.grados_volante, -VOLANTE_RANGO_GRADOS / 2, VOLANTE_RANGO_GRADOS / 2);
+
+    if (measurements.grados_volante > grados_volante_anterior) systemState.signoTorque = +1;
+    else if (measurements.grados_volante < grados_volante_anterior) systemState.signoTorque = -1;
+    grados_volante_anterior = measurements.grados_volante;
+}
+
+void calcularTorque() {
+    measurements.torque_final = -systemState.signoTorque * 3 * fabs(measurements.corriente_final);
+    measurements.torque_final_volante = calcularTorqueVolante(measurements.torque_final);
+
+    unsigned long currentMillis = millis();
+    if (currentMillis - previousSuavizado >= intervaloSuavizado) {
+        previousSuavizado = currentMillis;
+        measurements.voltaje_suave = ALPHA_SUAVE * measurements.voltaje_final + (1.0f - ALPHA_SUAVE) * measurements.voltaje_suave;
+        measurements.torque_final_suave = ALPHA_SUAVE * measurements.torque_final + (1.0f - ALPHA_SUAVE) * measurements.torque_final_suave;
+        measurements.torque_final_volante_suave = ALPHA_SUAVE * measurements.torque_final_volante + (1.0f - ALPHA_SUAVE) * measurements.torque_final_volante_suave;
+    }
+}
+
+void aplicarTopeVirtual() {
+    const float ZONA_MUERTA_CENTRADO = 3.0f;  // zona muerta de ±3°
+    float torque_centrado_virtual = 0.0f;
+
+    if (systemState.autocentradoActivado && abs(measurements.grados_volante) > ZONA_MUERTA_CENTRADO) {
+        torque_centrado_virtual = -RIGIDEZ_CENTRADO_VEL * measurements.grados_volante;
+    }
+
+    if (measurements.grados_volante > VOLANTE_RANGO_GRADOS / 2 - TORQUE_ZONE_DEG) {
+        measurements.par_virtual = -TORQUE_LIMIT_VIRTUAL;
+    } else if (measurements.grados_volante < -VOLANTE_RANGO_GRADOS / 2 + TORQUE_ZONE_DEG) {
+        measurements.par_virtual = TORQUE_LIMIT_VIRTUAL;
+    } else {
+        measurements.par_virtual = torque_centrado_virtual;
+    }
+
+    if (systemState.torqueActivado) {
+        dxl.torqueOn(DXL_ID);
+        float torque_total = measurements.torque_final_volante_suave + measurements.par_virtual;
+        int16_t corriente_dxl_mA = (torque_total / TORQUE_MAX_VOLANTE) * 1193;
+        corriente_dxl_mA = constrain(corriente_dxl_mA, -1193, 1193);
+        dxl.setGoalCurrent(DXL_ID, corriente_dxl_mA, UNIT_MILLI_AMPERE);
+    } else {
+        dxl.torqueOff(DXL_ID);
+    }
+}
+
+void enviarCAN() {
+    CAN_frame_t tx_frame;
+    tx_frame.FIR.B.FF = CAN_frame_std;
+    tx_frame.MsgID = 0x298;
+    tx_frame.FIR.B.DLC = 8;
     
-    // Procesar comandos serie (sin bloqueo)
-    processSerialCommands();
+    // Calcular dirección en bits (10-250)
+    float direccion_bits_f = (measurements.grados_volante + VOLANTE_RANGO_GRADOS / 2) * (240.0f / VOLANTE_RANGO_GRADOS) + 10.0f;
+    direccion_bits_f = constrain(direccion_bits_f, 10.0f, 250.0f);
+    uint8_t direccion_bits = static_cast<uint8_t>(direccion_bits_f);
+    
+    // Bit de centrado (1 si está centrado, 0 si no)
+    uint8_t bit_centrado = (abs(measurements.grados_volante) < 5.0f) ? 1 : 0;
+
+    tx_frame.data.u8[0] = 5;
+    tx_frame.data.u8[1] = direccion_bits;
+    tx_frame.data.u8[2] = bit_centrado;
+    tx_frame.data.u8[3] = (uint8_t)velocidad_simulada;
+    tx_frame.data.u8[4] = 0x00;
+    tx_frame.data.u8[5] = 0x00;
+    tx_frame.data.u8[6] = 0x00;
+    tx_frame.data.u8[7] = 0x00;
+    
+    if (ESP32Can.CANWriteFrame(&tx_frame) != ESP_OK) {
+        Serial.println("Error al enviar mensaje CAN");
+    }
+}
+
+void imprimirDebug() {
+    Serial.print(measurements.voltaje_final, 4); Serial.print(",");
+    Serial.print(canData.last_duty); Serial.print(",");
+    Serial.print(canData.last_corriente); Serial.print(",");
+    Serial.print(canData.last_voltaje_CAN, 1); Serial.print(",");
+    Serial.print(canData.last_switch); Serial.print(",");
+    Serial.print(canData.last_temp); Serial.print(",");
+    Serial.print(canData.last_angle_dir); Serial.print(",");
+    Serial.print(canData.last_mapa); Serial.print(",");
+    Serial.print(canData.last_error); Serial.print(",");
+    
+    // Calcular dirección en bits para el debug (igual que en enviarCAN)
+    float direccion_bits_f = (measurements.grados_volante + VOLANTE_RANGO_GRADOS / 2) * (240.0f / VOLANTE_RANGO_GRADOS) + 10.0f;
+    direccion_bits_f = constrain(direccion_bits_f, 10.0f, 250.0f);
+    uint8_t direccion_bits = static_cast<uint8_t>(direccion_bits_f);
+    
+    Serial.print(direccion_bits); Serial.print(",");
+    Serial.print(encoderState.pulsadorValor); Serial.print(",");
+    Serial.print(measurements.voltaje_final, 4); Serial.print(",");
+    Serial.print(measurements.corriente_final, 4); Serial.print(",");
+    Serial.print(measurements.torque_final, 4); Serial.print(",");
+    Serial.print(measurements.torque_final_volante, 4); Serial.print(",");
+    Serial.print(measurements.voltaje_suave, 4); Serial.print(",");
+    Serial.print(measurements.torque_final_suave, 4); Serial.print(",");
+    Serial.print(measurements.torque_final_volante_suave, 4); Serial.print(",");
+    
+    // Calcular corriente Dynamixel para el debug
+    float torque_total = measurements.torque_final_volante_suave + measurements.par_virtual;
+    int16_t corriente_dxl_mA = (torque_total / TORQUE_MAX_VOLANTE) * 1193;
+    corriente_dxl_mA = constrain(corriente_dxl_mA, -1193, 1193);
+    Serial.println(corriente_dxl_mA);
+}
+
+void serialControlModoTorque() {
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '1') {
+            systemState.torqueActivado = !systemState.torqueActivado;
+            Serial.print("🔧 Torque ");
+            Serial.println(systemState.torqueActivado ? "ACTIVADO" : "DESACTIVADO");
+        }
+        if (c == '2') {
+            systemState.autocentradoActivado = !systemState.autocentradoActivado;
+            Serial.print("📐 Autocentrado ");
+            Serial.println(systemState.autocentradoActivado ? "ACTIVADO" : "DESACTIVADO");
+        }
+    }
 }
